@@ -49,8 +49,12 @@ a full game plays out before your first live demo.
 ### Reconnecting
 
 If a client's connection drops mid-game, just re-run the exact same
-`run_client.py` command with the same `--name`. The server re-attaches
-you to your existing role, alive/dead status, and current game phase.
+`run_client.py` command with the same `--name`, **from the same
+folder**. The server re-attaches you to your existing role, alive/dead
+status, and current game phase — and if you were mid-vote or
+mid-night-action, it re-sends you that exact prompt too. (Reconnect is
+protected by a small local token file the client saves on first join —
+see "Reconnect security" below for why, and why the folder matters.)
 
 ---
 
@@ -222,9 +226,21 @@ python tests/verify_curses_client.py
 # exits on its own after "Press Enter to close" -- the fix for the
 # curses loop spinning forever and never restoring the terminal
 python tests/verify_clean_exit.py
+
+# Same exit-on-game-over check for the --no-curses fallback client
+python tests/verify_simple_client_exit.py
+
+# Hijack blocked (wrong/no token rejected, correct token accepted) and
+# reconnect-restores-the-active-prompt (with a real recomputed
+# remaining timeout, not a reset window)
+python tests/verify_reconnect.py
+
+# graveyard field present in broadcasts once there's an elimination,
+# and the Double Agent's reveal text is correctly formatted
+python tests/verify_graveyard_and_double_agent.py
 ```
 
-Both suites are included in this repo and pass as of this commit.
+All of the above are included in this repo and pass as of this commit.
 `test_engine.py` covers the rules in isolation (23 tests: role-pool
 assignment constraints, Saboteur-always-human, Double Agent's
 true-vs-apparent alignment, Doctor self-save, sabotage nullification,
@@ -235,6 +251,32 @@ correct final reveal — proving the networking/threading/timeout
 plumbing works end-to-end, not just the logic in isolation.
 
 ---
+
+## Reconnect security
+
+Reconnecting used to be matched by name alone -- which meant anyone
+who knew (or guessed) a disconnected player's name could reconnect
+*as* them and immediately inherit their role, private info, and vote.
+Fixed with a per-player secret token: issued once on first join, saved
+locally by the client (a small `.mafia_rejoin_<name>.token` file next
+to wherever you run it from), and required to match on any later
+reconnect. A mismatch is rejected with a clear error instead of
+silently taking over the slot. Run the client from the same folder
+each time so it can find its saved token.
+
+Separately, a reconnect now also restores whatever you should
+currently be seeing -- if you drop mid-vote or mid-night-action and
+reconnect within the timeout window, you get the exact prompt back
+(with a freshly recomputed remaining time, not a reset full window)
+instead of being stuck with nothing on screen despite still being able
+to act in time.
+
+## Graveyard
+
+A compact, running "Graveyard: Alice(VILLAGER), Bob(DETECTIVE)" line
+is shown after every elimination and on reconnect, so you don't have
+to scroll back through the log to remember who's already out and what
+they were.
 
 ## Death animation
 
@@ -260,7 +302,33 @@ down):
  `--'                             / \
 ```
 
-## Fixes since first draft
+## Fixes -- latest round (reconnect security, graveyard, double agent, bot variety)
+
+- **Reconnect hijack.** See "Reconnect security" above.
+- **Reconnect didn't restore the active prompt.** See "Reconnect
+  security" above.
+- **The plain-text fallback client (`--no-curses` / stock Windows
+  Python) never exited after the game ended.** The curses client had
+  already been fixed for this, but the fallback client's own input
+  loop had the identical bug -- nothing set an exit condition on
+  `game_over` or on the connection dropping, so it ran forever until
+  manually Ctrl+C'd. Same fix applied there: "Press Enter to close" on
+  both cases, and a "Goodbye!" confirmation once it actually exits.
+- **The Double Agent's row in the final "reveal" table showed the raw
+  `DOUBLE_AGENT` enum value** instead of the friendly "DOUBLE AGENT
+  (secretly Mafia-aligned)" text used everywhere else (death
+  announcements, the match summary). Fixed for consistency. (We
+  couldn't find a structural reason a Double Agent would miss the
+  game-over broadcast entirely -- the broadcast logic doesn't filter
+  by role anywhere -- so if that still happens, it's worth re-testing
+  now that the reconnect-prompt fix above is in, since a reconnect
+  around when the game ended is a more likely explanation.)
+- **More bot dialogue variety.** Expanded the discussion line banks
+  roughly 3-4x (4→14 generic lines, 4→14 suspicion lines, 3→12 Mafia
+  deflection lines) so bots repeat themselves far less over a longer
+  match.
+
+## Fixes -- earlier round (curses UI rewrite, chat double-echo, death animation, terminal not restoring)
 
 - **Curses client wasn't exiting after the game ended.** The main
   loop's exit flag (`self.running`) was only ever set to `False` by
@@ -322,7 +390,7 @@ Found and fixed during hands-on playtesting:
   *except* the player who sent it); the client now logs its own sent
   message locally instead, so it still shows exactly once.
 
-## Fixes from the previous round (still in effect)
+## Fixes -- first round (timer/countdown, game-over summary, can't-vote notice, night-phase concurrency, case-insensitive matching)
 
 - **Countdown timer.** Every timed prompt (discussion / vote / night
   action / sabotage decision) now shows a live countdown on the

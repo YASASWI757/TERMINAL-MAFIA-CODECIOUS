@@ -26,6 +26,22 @@ class Player:
     alive: bool = True
     saboteur_used: bool = False
 
+    # A per-player secret issued on first join and required (must match)
+    # to reconnect as this player later. Without this, reconnect was
+    # matched by name alone -- meaning anyone who knew (or guessed) a
+    # disconnected player's name could reconnect AS them and inherit
+    # their role, private info, and vote, no proof required. This closes
+    # that: only a client holding the matching token can re-attach.
+    rejoin_token: Optional[str] = None
+
+    # The most recent "prompt"-type message sent to this player, and
+    # when it expires -- kept so that if they reconnect mid-window, we
+    # can re-send them the exact prompt (with a freshly recomputed
+    # remaining timeout) instead of leaving them stuck with no prompt
+    # at all despite still technically being able to act in time.
+    active_prompt: Optional[dict] = None
+    active_prompt_deadline: Optional[float] = None
+
     # Bot-only memory: a confirmed Mafia read from investigation, so a
     # Detective bot can act on its own information during voting.
     known_mafia_id: Optional[str] = None

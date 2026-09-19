@@ -36,6 +36,7 @@ import threading
 import time
 import queue
 import textwrap
+import os
 
 from mafia import protocol
 
@@ -44,6 +45,44 @@ try:
     _HAS_CURSES = True
 except ImportError:
     _HAS_CURSES = False
+
+
+# ----------------------------------------------------------------------
+# Reconnect token persistence
+# ----------------------------------------------------------------------
+# The server now requires proof you're the same client that originally
+# joined as a given name before it'll reconnect you as that player --
+# otherwise anyone who knew (or guessed) a disconnected player's name
+# could reconnect AS them. The server issues a token on first join; we
+# save it to a small local file so re-running this same command from
+# the same folder "just works" the same way it always did, with no new
+# flag or step for the player to remember.
+
+def _token_file_path(name):
+    safe_name = "".join(c for c in name if c.isalnum() or c in ("-", "_")) or "player"
+    return f".mafia_rejoin_{safe_name}.token"
+
+
+def _load_saved_token(name):
+    path = _token_file_path(name)
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                token = f.read().strip()
+                return token or None
+        except OSError:
+            return None
+    return None
+
+
+def _save_token(name, token):
+    if not token:
+        return
+    try:
+        with open(_token_file_path(name), "w") as f:
+            f.write(token)
+    except OSError:
+        pass  # non-fatal -- a future reconnect just won't be pre-authenticated
 
 
 # A short, silent-film-style ASCII beat played in place (redrawn over
@@ -213,6 +252,17 @@ class ClientUI:
         if len(self.log_lines) > 1000:  # cap memory for a very long match
             self.log_lines = self.log_lines[-1000:]
 
+    def _log_graveyard(self, graveyard):
+        """Compact running tally of everyone eliminated so far, shown
+        right after whatever just changed it -- interpretation of the
+        'graveyard chart' ask: a quick-glance history rather than
+        needing to scroll back through the whole log to remember who's
+        already out and what they were."""
+        if not graveyard:
+            return
+        parts = [f"{e['player']}({e['role']})" for e in graveyard]
+        self._log("Graveyard: " + ", ".join(parts))
+
     # ---- death animation ----
 
     def _play_death_animation(self):
@@ -269,6 +319,7 @@ class ClientUI:
 
         elif t == "joined":
             self._log(f"[SERVER] {msg['text']}")
+            _save_token(self.name, msg.get("token"))
 
         elif t == "error":
             self._log(f"[ERROR] {msg['text']}")
@@ -305,6 +356,7 @@ class ClientUI:
                 self._log(f"{msg['player']} was found dead this morning. They were... {msg['role']}!")
             else:
                 self._log("No one died last night.")
+            self._log_graveyard(msg.get("graveyard"))
 
         elif t == "eliminated":
             self._log(msg["text"])
@@ -345,10 +397,12 @@ class ClientUI:
                 self._log(f"{msg['eliminated']} has been eliminated. They were {msg['eliminated_role']}!")
             else:
                 self._log("No majority reached -- no one was eliminated.")
+            self._log_graveyard(msg.get("graveyard"))
 
         elif t == "state_snapshot":
             self._log(f"[Reconnected] Round {msg['round']}, Phase {msg['phase']}, "
                       f"Role: {msg['role']}, You are: {'ALIVE' if msg['you_alive'] else 'dead'}")
+            self._log_graveyard(msg.get("graveyard"))
 
         elif t == "game_over":
             self._clear_countdown()
@@ -449,15 +503,20 @@ def _run_curses_client(sock, name):
 # ======================================================================
 
 def _run_simple_client(sock, name):
-    state = {"prompt_type": None}
+    state = {"prompt_type": None, "name": name, "game_ended": False}
 
     def _listen():
         try:
             for msg in protocol.recv_lines(sock):
                 _handle_message_simple(msg, state)
         except (ConnectionError, OSError):
+            pass
+        if state["game_ended"]:
+            print("\n[Server closed the connection now that the match has ended.]")
+        else:
             print("\n[Connection lost -- the server may have ended, or your network "
                   "dropped. Re-run this command with the same --name to reconnect.]")
+        state["prompt_type"] = "exit"
 
     threading.Thread(target=_listen, daemon=True).start()
 
@@ -471,16 +530,31 @@ def _run_simple_client(sock, name):
             line = input()
         except EOFError:
             break
+        if state.get("prompt_type") == "exit":
+            # Bare Enter is expected here -- don't fall through to the
+            # empty-input check below, which would otherwise swallow it
+            # and leave this loop (and the process) running forever.
+            break
         line = line.strip()
         if not line:
             continue
         _send_current_simple(sock, state, line)
+
+    print("Goodbye!")
+
+
+def _print_graveyard_simple(graveyard):
+    if not graveyard:
+        return
+    parts = [f"{e['player']}({e['role']})" for e in graveyard]
+    print("Graveyard: " + ", ".join(parts))
 
 
 def _handle_message_simple(msg, state):
     t = msg.get("type")
     if t == "joined":
         print(f"[SERVER] {msg['text']}")
+        _save_token(state.get("name"), msg.get("token"))
     elif t == "error":
         print(f"[ERROR] {msg['text']}")
     elif t == "role_assigned":
@@ -506,6 +580,7 @@ def _handle_message_simple(msg, state):
             print(f"\n{msg['player']} was found dead this morning. They were... {msg['role']}!")
         else:
             print("\nNo one died last night.")
+        _print_graveyard_simple(msg.get("graveyard"))
     elif t == "eliminated":
         print(f"\n{msg['text']}\n")
         state["prompt_type"] = None
@@ -533,11 +608,13 @@ def _handle_message_simple(msg, state):
             print(f"{msg['eliminated']} has been eliminated. They were {msg['eliminated_role']}!")
         else:
             print("No majority reached -- no one was eliminated.")
+        _print_graveyard_simple(msg.get("graveyard"))
     elif t == "state_snapshot":
         print(f"\n[Reconnected] Round {msg['round']}, Phase {msg['phase']}, "
               f"Role: {msg['role']}, You are: {'ALIVE' if msg['you_alive'] else 'dead'}")
+        _print_graveyard_simple(msg.get("graveyard"))
     elif t == "game_over":
-        state["prompt_type"] = None
+        state["game_ended"] = True
         print("\n" + "#" * 50)
         print(f"GAME OVER -- {msg['winner']} WIN! ({msg.get('rounds_played', '?')} rounds played)")
         entries = msg.get("elimination_log") or []
@@ -550,6 +627,13 @@ def _handle_message_simple(msg, state):
             status = "alive" if r["alive"] else "dead"
             print(f"  {r['name']:20s} {r['role']:15s} ({status})")
         print("#" * 50)
+        print("\nPress Enter to close.")
+        # Same fix as the curses client: nothing previously set an exit
+        # condition here, so this loop (and the process) just ran
+        # forever after the game ended until the user manually Ctrl+C'd.
+        state["prompt_type"] = "exit"
+
+
 
 
 def _send_current_simple(sock, state, line):
@@ -590,7 +674,7 @@ def main():
         print(f"Could not connect to {args.host}:{args.port} -- {e}")
         sys.exit(1)
 
-    protocol.send_json(sock, {"name": args.name})
+    protocol.send_json(sock, {"name": args.name, "token": _load_saved_token(args.name)})
 
     try:
         if _HAS_CURSES and not args.no_curses:

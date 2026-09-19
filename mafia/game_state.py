@@ -32,6 +32,11 @@ class GameState:
 
     last_night_death: Optional[Player] = None
 
+    # When the current DISCUSSION window ends (time.time() + timeout),
+    # so a player reconnecting mid-discussion can be told the correct
+    # remaining time instead of either nothing or a restarted countdown.
+    discussion_deadline: Optional[float] = None
+
     # Full match history: one entry per elimination, in order. Used to
     # build the end-of-game summary sent to every player (not just the
     # bare final role list).

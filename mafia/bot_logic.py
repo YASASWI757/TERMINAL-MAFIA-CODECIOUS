@@ -23,6 +23,16 @@ GENERIC_LINES = [
     "We need to think carefully about this vote.",
     "Something feels off tonight.",
     "Let's not rush the vote this time.",
+    "I'm still piecing things together.",
+    "Anyone else have a read on this, or is it just me?",
+    "Let's not panic-vote here.",
+    "I want to hear more before I decide.",
+    "This town's too quiet for my liking.",
+    "We can't afford another wrong elimination.",
+    "I keep going back and forth on this one.",
+    "Something about last night still bugs me.",
+    "Let's slow down and actually talk this through.",
+    "I don't want to just follow the loudest voice here.",
 ]
 
 SUSPECT_LINES = [
@@ -30,12 +40,31 @@ SUSPECT_LINES = [
     "Has anyone else noticed {target} acting strange?",
     "I don't trust {target}'s silence.",
     "My gut says {target} isn't telling us everything.",
+    "{target} has been awfully quiet this round.",
+    "Something about what {target} said doesn't add up.",
+    "I keep coming back to {target} for some reason.",
+    "{target}, care to explain yourself?",
+    "Why does {target} keep deflecting like that?",
+    "I'd like to hear more from {target} before we vote.",
+    "{target}'s story keeps shifting a little.",
+    "Out of everyone, {target} worries me the most right now.",
+    "Not fully convinced, but {target} is on my radar.",
+    "{target} was quick to accuse someone else -- that's telling.",
 ]
 
 MAFIA_DEFLECT_LINES = [
     "I think we should focus on {target}, they've been quiet.",
     "{target} hasn't given a straight answer yet.",
     "Honestly {target} seems the most suspicious to me.",
+    "{target}'s vote history doesn't sit right with me.",
+    "We keep letting {target} off easy -- why?",
+    "I'd rather we look hard at {target} this round.",
+    "Something about {target} feels off to me too.",
+    "{target} is deflecting a lot for someone who's innocent.",
+    "Can we actually talk about {target} for a second?",
+    "I don't buy {target}'s explanation from earlier.",
+    "{target} keeps steering us away from themself.",
+    "My vote's leaning {target} unless someone convinces me otherwise.",
 ]
 
 

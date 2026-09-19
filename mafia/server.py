@@ -54,6 +54,7 @@ import threading
 import queue
 import time
 import random
+import secrets
 from typing import Optional
 
 from . import protocol
@@ -154,6 +155,7 @@ class GameServer:
             return
 
         name = (first_msg.get("name") or "").strip()
+        provided_token = first_msg.get("token")
         if not name:
             protocol.send_json(conn, {"type": "error", "text": "A name is required to join."})
             conn.close()
@@ -162,6 +164,23 @@ class GameServer:
         with self.lock:
             existing = next((p for p in self.players if p.name == name and not p.connected), None)
             if existing:
+                # Reconnect only succeeds if this connection can prove
+                # it's the same client that originally joined as this
+                # player -- matching on name alone would let anyone who
+                # knows (or just guesses) a disconnected player's name
+                # reconnect AS them and inherit their role, private
+                # info, and vote. The token is issued once on first
+                # join and never shown to anyone else.
+                if existing.rejoin_token is not None and provided_token != existing.rejoin_token:
+                    protocol.send_json(conn, {
+                        "type": "error",
+                        "text": f"A player named '{name}' is already in this game, and this "
+                                f"connection doesn't have their reconnect token. If this is "
+                                f"really you, run the client from the same folder you joined "
+                                f"from originally (it saves a token there for exactly this).",
+                    })
+                    conn.close()
+                    return
                 existing.conn = conn
                 existing.connected = True
                 player = existing
@@ -176,10 +195,13 @@ class GameServer:
                     conn.close()
                     return
                 player = Player(id=name, name=name, is_bot=False, conn=conn)
+                player.rejoin_token = secrets.token_hex(8)
                 self.players.append(player)
                 print(f"[SERVER] {name} joined. ({len(self.players)} human player(s) so far)")
 
-        protocol.send_json(conn, {"type": "joined", "text": f"Welcome, {name}!"})
+        protocol.send_json(conn, {
+            "type": "joined", "text": f"Welcome, {name}!", "token": player.rejoin_token,
+        })
         if player.role is not None:
             self._send_state_snapshot(player)
 
@@ -249,6 +271,20 @@ class GameServer:
         except OSError:
             player.connected = False
 
+    def _send_prompt(self, player, msg, timeout):
+        """
+        Like _send_private, but also records what was sent and when it
+        expires, so a mid-window reconnect can be given the same prompt
+        back (see _send_state_snapshot) instead of silently missing it.
+        """
+        self._send_private(player, msg)
+        player.active_prompt = msg
+        player.active_prompt_deadline = time.time() + timeout
+
+    def _clear_prompt(self, player):
+        player.active_prompt = None
+        player.active_prompt_deadline = None
+
     def _send_state_snapshot(self, player):
         gs = self.game_state
         self._send_private(player, {
@@ -258,7 +294,26 @@ class GameServer:
             "role": player.role.value if player.role else None,
             "alive_players": [p.name for p in gs.alive_players()],
             "you_alive": player.alive,
+            "graveyard": gs.elimination_log,
         })
+
+        # Restore whatever this player should currently be seeing, so
+        # reconnecting mid-window doesn't leave them stuck with no
+        # prompt even though they can technically still act in time
+        # (the collection loop they're waiting on doesn't care whether
+        # they were disconnected -- only the CLIENT needs to be told
+        # what to ask for again).
+        now = time.time()
+        if gs.phase == "DISCUSSION" and gs.discussion_deadline and gs.discussion_deadline > now:
+            self._send_private(player, {
+                "type": "phase", "name": "DISCUSSION", "round": gs.round_number,
+                "timeout": int(gs.discussion_deadline - now),
+                "alive_players": [p.name for p in gs.alive_players()],
+            })
+        elif player.active_prompt and player.active_prompt_deadline and player.active_prompt_deadline > now:
+            resend = dict(player.active_prompt)
+            resend["timeout"] = int(player.active_prompt_deadline - now)
+            self._send_private(player, resend)
 
     def _fill_bots(self):
         with self.lock:
@@ -431,10 +486,10 @@ class GameServer:
 
         detective_options = alive_names_except(detective.id) if detective else []
         if detective:
-            self._send_private(detective, {
+            self._send_prompt(detective, {
                 "type": "prompt", "prompt_type": "night_action", "action": "investigate",
                 "timeout": NIGHT_ACTION_TIMEOUT, "options": detective_options,
-            })
+            }, NIGHT_ACTION_TIMEOUT)
 
             def collect_detective():
                 results["detective"] = self._collect_action(
@@ -446,10 +501,10 @@ class GameServer:
 
         mafia_options = alive_names_except(mafia_actor.id) if mafia_actor else []
         if mafia_actor:
-            self._send_private(mafia_actor, {
+            self._send_prompt(mafia_actor, {
                 "type": "prompt", "prompt_type": "night_action", "action": "kill",
                 "timeout": NIGHT_ACTION_TIMEOUT, "options": mafia_options,
-            })
+            }, NIGHT_ACTION_TIMEOUT)
 
             def collect_mafia():
                 results["mafia"] = self._collect_action(
@@ -461,10 +516,10 @@ class GameServer:
 
         doctor_options = [p.name for p in gs.alive_players()] if doctor else []
         if doctor:
-            self._send_private(doctor, {
+            self._send_prompt(doctor, {
                 "type": "prompt", "prompt_type": "night_action", "action": "protect",
                 "timeout": NIGHT_ACTION_TIMEOUT, "options": doctor_options,
-            })
+            }, NIGHT_ACTION_TIMEOUT)
 
             def collect_doctor():
                 results["doctor"] = self._collect_action(
@@ -476,10 +531,10 @@ class GameServer:
 
         saboteur_options = alive_names_except(saboteur.id) + ["skip"] if saboteur_active else []
         if saboteur_active:
-            self._send_private(saboteur, {
+            self._send_prompt(saboteur, {
                 "type": "prompt", "prompt_type": "sabotage_decision",
                 "timeout": NIGHT_ACTION_TIMEOUT, "options": saboteur_options,
-            })
+            }, NIGHT_ACTION_TIMEOUT)
 
             def collect_saboteur():
                 results["saboteur"] = self._collect_action(
@@ -493,6 +548,12 @@ class GameServer:
             t.start()
         for t in threads:
             t.join(timeout=NIGHT_ACTION_TIMEOUT + 3)
+
+        # Night is over -- none of these prompts are still "active" for
+        # reconnect-resend purposes, whether or not each role answered.
+        for p in (detective, mafia_actor, doctor, saboteur):
+            if p:
+                self._clear_prompt(p)
 
         # ---- Process each result now that all are in ----
 
@@ -560,9 +621,10 @@ class GameServer:
         if gs.last_night_death:
             d = gs.last_night_death
             self._broadcast({"type": "death_announcement", "player": d.name,
-                              "role": self._revealed_role_text(d)})
+                              "role": self._revealed_role_text(d), "graveyard": gs.elimination_log})
         else:
-            self._broadcast({"type": "death_announcement", "player": None, "role": None})
+            self._broadcast({"type": "death_announcement", "player": None, "role": None,
+                              "graveyard": gs.elimination_log})
 
         gs.phase = "DISCUSSION"
         print(f"[SERVER] === DAY {gs.round_number}: discussion ===")
@@ -583,6 +645,7 @@ class GameServer:
         alive_bots = [p for p in gs.alive_players() if p.is_bot]
         stop_event = threading.Event()
         high = max(3, DISCUSSION_TIMEOUT - 5)
+        gs.discussion_deadline = time.time() + DISCUSSION_TIMEOUT
 
         def bot_talk(bot):
             time.sleep(random.uniform(2, high))
@@ -599,6 +662,7 @@ class GameServer:
             t.start()
         time.sleep(DISCUSSION_TIMEOUT)
         stop_event.set()
+        gs.discussion_deadline = None
 
     def _run_voting(self, gs):
         alive = gs.alive_players()
@@ -606,8 +670,8 @@ class GameServer:
         options = [p.name for p in alive] + ["abstain"]
 
         for p in alive:
-            self._send_private(p, {"type": "prompt", "prompt_type": "vote",
-                                    "timeout": VOTE_TIMEOUT, "options": options})
+            self._send_prompt(p, {"type": "prompt", "prompt_type": "vote",
+                                   "timeout": VOTE_TIMEOUT, "options": options}, VOTE_TIMEOUT)
         # Eliminated players don't get a vote prompt at all -- tell them
         # plainly why, rather than leaving them to wonder why nothing
         # is happening on their screen.
@@ -632,6 +696,11 @@ class GameServer:
             t.start()
         for t in threads:
             t.join(timeout=VOTE_TIMEOUT + 3)
+
+        # Voting is over -- these prompts are no longer "active" for
+        # reconnect-resend purposes, whether or not each player voted.
+        for p in alive:
+            self._clear_prompt(p)
 
         votes = {}
         for p in alive:
@@ -668,12 +737,18 @@ class GameServer:
             "eliminated": eliminated_player.name if eliminated_player else None,
             "eliminated_role": (self._revealed_role_text(eliminated_player)
                                  if eliminated_player else None),
+            "graveyard": gs.elimination_log,
         })
 
     # ---- END ----
 
     def _end_game(self, gs, winner):
-        reveal = [{"name": p.name, "role": p.role.value, "alive": p.alive} for p in gs.players]
+        # Uses _revealed_role_text, not the raw role value, so the
+        # Double Agent's row reads "DOUBLE AGENT (secretly Mafia-
+        # aligned)" here too, matching every other reveal in the game
+        # instead of showing the bare enum name.
+        reveal = [{"name": p.name, "role": self._revealed_role_text(p), "alive": p.alive}
+                  for p in gs.players]
         gs.phase = "GAME_OVER"
         self._broadcast({
             "type": "game_over",
