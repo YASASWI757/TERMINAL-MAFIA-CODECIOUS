@@ -46,6 +46,39 @@ except ImportError:
     _HAS_CURSES = False
 
 
+# A short, silent-film-style ASCII beat played in place (redrawn over
+# itself, not scrolled) right before the death reveal text. Plain
+# characters only, no image/video conversion -- just a handful of
+# hand-built frames with guaranteed column alignment (generated once
+# with a small script, then baked in as constants here). Runs for
+# roughly 1.5 seconds total. Curses-only: the plain-text fallback
+# client keeps its original one-line death announcement, same as the
+# live countdown is a curses-only touch.
+DEATH_ANIMATION_FRAMES = [
+    " .--.                              O\n"
+    "( oo )>  *                        /|\\\n"
+    " `--'                             / \\",
+
+    " .--.                              O\n"
+    "( oo )>          *                /|\\\n"
+    " `--'                             / \\",
+
+    " .--.                              O\n"
+    "( oo )>                  *        /|\\\n"
+    " `--'                             / \\",
+
+    " .--.                              O\n"
+    "( oo )*                           \\|/\n"
+    " `--'                              |",
+
+    " .--.\n"
+    "( oo )>\n"
+    " `--'                          _O__\n"
+    "                               \\_/`.",
+]
+DEATH_ANIMATION_FRAME_DELAY = 0.28  # seconds per frame
+
+
 # ======================================================================
 # Curses UI (primary experience -- Linux / Mac, or Windows with
 # `windows-curses` installed)
@@ -172,6 +205,34 @@ class ClientUI:
         if len(self.log_lines) > 1000:  # cap memory for a very long match
             self.log_lines = self.log_lines[-1000:]
 
+    # ---- death animation ----
+
+    def _play_death_animation(self):
+        """
+        Briefly takes over the whole screen to play DEATH_ANIMATION_FRAMES
+        in place (each frame redrawn over the last, not scrolled), then
+        hands back to the normal log view. Runs on the main thread like
+        all drawing here, so it briefly pauses keyboard handling for its
+        ~1.5s runtime -- the same trade-off any short cutscene makes.
+        """
+        h, w = self.stdscr.getmaxyx()
+        for frame in DEATH_ANIMATION_FRAMES:
+            lines = frame.split("\n")
+            frame_w = max(len(line) for line in lines)
+            start_row = max(0, (h - len(lines)) // 2)
+            start_col = max(0, (w - frame_w) // 2)
+            self.stdscr.erase()
+            for i, line in enumerate(lines):
+                row = start_row + i
+                if 0 <= row < h:
+                    try:
+                        self.stdscr.addnstr(row, start_col, line, max(0, w - start_col - 1))
+                    except curses.error:
+                        pass
+            self.stdscr.refresh()
+            time.sleep(DEATH_ANIMATION_FRAME_DELAY)
+        time.sleep(0.3)  # brief hold on the final frame before returning to the log
+
     # ---- incoming server messages ----
 
     def _drain_incoming(self):
@@ -223,6 +284,7 @@ class ClientUI:
 
         elif t == "death_announcement":
             if msg["player"]:
+                self._play_death_animation()
                 self._log(f"{msg['player']} was found dead this morning. They were... {msg['role']}!")
             else:
                 self._log("No one died last night.")

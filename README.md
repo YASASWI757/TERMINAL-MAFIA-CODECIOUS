@@ -231,6 +231,30 @@ plumbing works end-to-end, not just the logic in isolation.
 
 ---
 
+## Death animation
+
+When a night kill happens, the curses client plays a short (~1.5s)
+in-place ASCII beat before the "X was found dead... they were ROLE!"
+line -- each frame redraws over the last (not scrolled), matching how
+a real terminal-video plays. It's five hand-built, hard-coded frames
+(no image/video conversion, no external asset, no dependency) -- a
+small script generated them once with guaranteed column alignment
+(every line padded to the same width, gun/victim positions fixed
+across frames, only the bullet position and victim pose change), and
+the resulting strings are baked into `run_client.py` as
+`DEATH_ANIMATION_FRAMES`. Curses-only, same as the live countdown --
+the plain-text fallback client keeps its original single-line
+announcement.
+
+Preview (frame 1 of 5 -- the bullet travels further right across
+frames 2-3, then frame 4 is the impact/flash, frame 5 is the victim
+down):
+```
+ .--.                              O
+( oo )>  *                        /|\
+ `--'                             / \
+```
+
 ## Fixes since first draft
 
 Found and fixed during hands-on playtesting:

@@ -99,9 +99,11 @@ def main():
     #    plausible-looking token and hit Enter -- we're testing that
     #    keystrokes are accepted and don't crash the UI, not exercising
     #    exact game logic, which the other test suites already cover).
-    time.sleep(4.0)
+    #    Extra slack here also covers the ~1.7s the death animation
+    #    blocks the main loop for when a night kill actually happens.
+    time.sleep(5.0)
     os.write(master_fd, b"x\r")  # harmless keystroke + Enter (likely "invalid", that's fine)
-    time.sleep(1.0)
+    time.sleep(2.5)
     output2 = read_available(2.0)
     assert proc.poll() is None, f"Client crashed after keystroke (code {proc.poll()})"
     print(f"[OK] Client accepted a keystroke + Enter without crashing "
