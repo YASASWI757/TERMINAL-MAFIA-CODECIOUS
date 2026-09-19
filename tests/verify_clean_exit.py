@@ -1,21 +1,14 @@
 """
-Directly verifies the fix for "the terminal doesn't close": after
-game_over, the curses client must actually exit on its own (once the
-player presses Enter at the "Press Enter to close" prompt) -- not sit
-there in raw terminal mode forever, which would leave curses.wrapper's
-endwin() never called and the user's terminal stuck.
-
-Runs the real client as a subprocess attached to a pseudo-terminal
-against a real (short-timeout) server, lets a full game play out
-(without ever sending it a deliberate answer -- the disconnect-safe
-timeout path already covers that), waits for the GAME OVER banner to
-appear in the captured output, sends a single Enter keystroke, and
-asserts the process exits **on its own** shortly after -- no
-SIGTERM/SIGKILL needed -- with the expected "Terminal restored."
-confirmation printed and no traceback on stderr.
-
-Run with:  python tests/verify_clean_exit.py
+Verifies the curses client actually exits after game over instead of
+hanging forever. Since play-again is now offered after every match
+with a human in it, the flow is: wait for the play-again prompt (not
+the earlier "Press Enter to close", which gets functionally
+superseded by it), decline, wait for the resulting connection-lost
+message, then confirm Enter at THAT point makes the process exit on
+its own -- no SIGTERM needed.
 """
+
+# Run with:  python tests/verify_clean_exit.py
 
 import os
 import pty
@@ -67,8 +60,19 @@ def main():
 
     captured = b""
 
-    def pump(timeout):
+    def pump(timeout, until_marker=b"Press Enter to close"):
+        """
+        Reads until until_marker appears in NEWLY-arrived data (not
+        just anywhere in the cumulative buffer) -- important here
+        because "Press Enter to close" legitimately appears TWICE in
+        this flow (once right after GAME OVER, superseded by the
+        play-again prompt; again for real once the connection drops
+        after declining), and a naive "is it in captured" check would
+        false-positive on the first occurrence when waiting for the
+        second.
+        """
         nonlocal captured
+        start_len = len(captured)
         deadline = time.time() + timeout
         while time.time() < deadline:
             r, _, _ = select.select([master_fd], [], [], 0.2)
@@ -80,21 +84,36 @@ def main():
                 if not chunk:
                     return
                 captured += chunk
-            if b"Press Enter to close" in captured:
+            if until_marker in captured[start_len:]:
                 return
 
     # Let the whole match play out with no deliberate input from us --
     # the disconnect-safe timeout path already handles that; we just
-    # need it to actually finish.
-    pump(timeout=60)
+    # need it to actually finish. Budget is generous because bots have
+    # a randomized 1.5-6s "thinking" delay that can occasionally exceed
+    # this test's shortened 2s timeouts, stretching some rounds out
+    # (a known, harmless artifact documented elsewhere in this suite).
+    pump(timeout=120, until_marker=b"Play again?")
     assert b"GAME OVER" in captured, (
         "Game never reached GAME OVER within 60s -- can't test the exit "
         "prompt without a finished match"
     )
-    assert b"Press Enter to close" in captured, (
-        "GAME OVER happened but the 'Press Enter to close' prompt never appeared"
+    assert b"Play again?" in captured, "The play-again prompt never appeared after GAME OVER"
+    print("[OK] Match completed and the play-again prompt appeared")
+
+    # Decline -- with only this one human in the game, "no" means
+    # nobody stays, so the server ends and the connection drops. Wait
+    # for the connection-lost message specifically (not "Press Enter
+    # to close" again -- that text is logged permanently into
+    # scrollback the first time and stays visible in every subsequent
+    # redraw, so re-matching on it would false-positive on the old
+    # occurrence rather than the genuinely new state).
+    os.write(master_fd, b"no\r")
+    pump(timeout=15, until_marker=b"Server closed the connection")
+    assert b"Server closed the connection" in captured[-4000:], (
+        "Declining play-again never led to the connection-lost message"
     )
-    print("[OK] Match completed and the exit prompt appeared")
+    print("[OK] Declining play-again led to the connection dropping and a real exit prompt")
 
     # This is the actual fix under test: pressing Enter here must make
     # the process exit ON ITS OWN.
@@ -106,6 +125,11 @@ def main():
         exited_on_its_own = True
     except subprocess.TimeoutExpired:
         pass
+
+    if not exited_on_its_own:
+        print("=== DIAGNOSTIC: tail of captured output ===")
+        print(captured[-2000:].decode(errors="replace"))
+        print("=== process still alive:", proc.poll() is None, "===")
 
     assert exited_on_its_own, (
         "Client did NOT exit on its own after Enter at the close prompt -- "

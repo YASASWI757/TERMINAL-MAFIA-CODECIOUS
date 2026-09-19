@@ -256,6 +256,10 @@ class ClientUI:
                 protocol.send_json(self.sock, {"type": "sabotage_decision", "target": line})
                 self._log(f"> Submitted: {line}")
                 self._clear_countdown()
+            elif self.prompt_type == "play_again":
+                protocol.send_json(self.sock, {"type": "play_again", "target": line})
+                self._log(f"> Submitted: {line}")
+                self._clear_countdown()
             else:
                 self._log("[INFO] Nothing is expecting input right now.")
         except OSError:
@@ -431,6 +435,7 @@ class ClientUI:
 
         elif t == "role_assigned":
             self.in_lobby = False
+            self.game_ended = False  # a fresh match is starting (first one, or a replay)
             self._log("=" * 50)
             self._log(f"YOUR ROLE: {msg['role']}")
             self._log(msg["description"])
@@ -537,6 +542,22 @@ class ClientUI:
             # cleanly instead of the screen staying frozen forever.
             self.prompt_type = "exit"
             self.prompt_hint = "Press Enter to close"
+
+        elif t == "play_again_prompt":
+            # Arrives right after game_over for any match that had at
+            # least one human -- overrides the "Press Enter to close"
+            # state that was just set, since there's something more to
+            # decide first. If this player doesn't answer in time (or
+            # says no), the server replaces them with a bot for the
+            # next match; if nobody stays, the connection will drop
+            # shortly after and the existing exit flow takes over from
+            # there -- no separate handling needed for that case.
+            timeout = msg.get("timeout", 20)
+            self.prompt_type = "play_again"
+            self.prompt_hint = "Play again? (yes/no)"
+            self._log("")
+            self._log(f"({timeout}s) Play again? (yes/no)")
+            self._set_countdown(timeout, "Play again?")
 
     # ---- drawing ----
 
@@ -668,6 +689,7 @@ def _handle_message_simple(msg, state):
     elif t == "error":
         print(f"[ERROR] {msg['text']}")
     elif t == "role_assigned":
+        state["game_ended"] = False  # a fresh match is starting (first one, or a replay)
         print("\n" + "=" * 50)
         print(f"YOUR ROLE: {msg['role']}")
         print(msg["description"])
@@ -743,7 +765,10 @@ def _handle_message_simple(msg, state):
         # forever after the game ended until the user manually Ctrl+C'd.
         state["prompt_type"] = "exit"
 
-
+    elif t == "play_again_prompt":
+        timeout = msg.get("timeout", 20)
+        state["prompt_type"] = "play_again"
+        print(f"\n({timeout}s) Play again? (yes/no)")
 
 
 def _send_current_simple(sock, state, line):
@@ -758,6 +783,8 @@ def _send_current_simple(sock, state, line):
             protocol.send_json(sock, {"type": "night_action", "target": line})
         elif prompt_type == "sabotage_decision":
             protocol.send_json(sock, {"type": "sabotage_decision", "target": line})
+        elif prompt_type == "play_again":
+            protocol.send_json(sock, {"type": "play_again", "target": line})
         else:
             print("[INFO] Nothing is expecting input right now.")
     except OSError:

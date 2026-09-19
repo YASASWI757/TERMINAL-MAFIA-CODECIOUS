@@ -238,6 +238,11 @@ python tests/verify_reconnect.py
 # graveyard field present in broadcasts once there's an elimination,
 # and the Double Agent's reveal text is correctly formatted
 python tests/verify_graveyard_and_double_agent.py
+
+# Play-again "yes" path: a human who stays gets a genuinely fresh
+# second match (new role_assigned, reshuffled roles, previously-dead
+# bots correctly resurrected), not stuck or disconnected
+python tests/verify_play_again.py
 ```
 
 All of the above are included in this repo and pass as of this commit.
@@ -251,6 +256,59 @@ correct final reveal — proving the networking/threading/timeout
 plumbing works end-to-end, not just the logic in isolation.
 
 ---
+
+## Round timers -- customizable at lobby creation
+
+Discussion/vote/night-action timers no longer have to be edited in
+`constants.py` to change. The host sets them when starting the server:
+
+```bash
+# Skip the prompt entirely by passing them on the command line:
+python run_server.py --discussion-timeout 60 --vote-timeout 20 --night-timeout 20
+
+# Or just leave them out -- you'll be asked interactively before the
+# lobby opens (press Enter on any of them to accept the default shown):
+python run_server.py
+#   Configure round timers for this match (press Enter to accept the default):
+#     Discussion phase (seconds) [90]:
+#     Voting phase (seconds) [30]:
+#     Night action phase (seconds) [25]:
+```
+
+`--auto-start` (headless mode) never prompts -- it silently uses
+`constants.py`'s defaults for anything not passed explicitly on the
+command line, so scripted/CI usage is unaffected. Under the hood,
+`GameServer` now takes these as constructor parameters (falling back
+to the constants only when not given), rather than the timers being
+fixed module-level globals -- this is also what makes per-server
+configuration possible in the first place.
+
+## Play again
+
+After a match ends, every connected human is asked "Play again?
+(yes/no)" with its own countdown. Anyone who says no, doesn't answer
+in time, or is disconnected gets replaced by a freshly-named bot for
+the next match -- the total player count stays exactly the same as
+the match that just ended, so `min_players` stays satisfied
+automatically without any extra bookkeeping. Bots always continue
+(reset to a clean state, roles reshuffled) since they have no opinion
+to ask. If nobody wants to continue, the server ends normally -- the
+existing "connection dropped, press Enter to close" flow handles that
+case without needing anything new.
+
+One real bug found and fixed while building this: declining play-again
+closes that player's connection server-side so their client gets a
+clean "connection closed" exit rather than sitting there indefinitely.
+The first attempt called `socket.close()` directly, but that player's
+own reader thread is still concurrently blocked inside `recv()` on the
+exact same socket at that moment -- a plain `close()` from a different
+thread doesn't reliably wake that up or guarantee the peer sees a
+clean EOF. Fixed with `socket.shutdown(SHUT_RDWR)` before `close()`,
+the standard fix for closing a socket out from under a thread that's
+concurrently reading it. Caught by a direct raw-socket test that
+bypassed the curses/PTY layer specifically to isolate this from
+higher-level noise -- confirmed the peer saw a hang before the fix and
+a clean EOF after.
 
 ## Lobby screen
 

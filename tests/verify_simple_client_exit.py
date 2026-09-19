@@ -1,8 +1,9 @@
 """
-Verifies the fallback client fix: it must exit on its own after
-"Press Enter to close" once the game ends, not run forever (the same
-bug that was already fixed for the curses client, but had not been
-applied to the --no-curses fallback path).
+Verifies the fallback (--no-curses) client exits cleanly after game
+over, same fix as the curses client. Since play-again is now offered
+after every match with a human in it, the flow is: wait for the
+play-again prompt, decline, wait for the connection-lost message,
+then confirm Enter at THAT point makes the process exit on its own.
 
 Unlike the curses client, this one doesn't need a pty -- it's plain
 stdin/stdout, so ordinary subprocess pipes work.
@@ -52,16 +53,42 @@ def main():
 
     # Let the whole match play out with no deliberate input -- the
     # disconnect-safe timeout path already covers unanswered prompts.
-    deadline = time.time() + 60
+    # Budget is generous because bots have a randomized 1.5-6s
+    # "thinking" delay that can occasionally exceed this test's
+    # shortened 2s timeouts, stretching some rounds out (a known,
+    # harmless artifact documented elsewhere in this suite).
+    deadline = time.time() + 120
     while time.time() < deadline:
-        if any("Press Enter to close" in line for line in captured):
+        if any("Play again?" in line for line in captured):
             break
         time.sleep(0.3)
 
     joined_text = "".join(captured)
-    assert "GAME OVER" in joined_text, "Match never reached GAME OVER within 60s"
-    assert "Press Enter to close" in joined_text, "Exit prompt never appeared"
-    print("[OK] Match completed and the exit prompt appeared")
+    assert "GAME OVER" in joined_text, "Match never reached GAME OVER within 120s"
+    assert "Play again?" in joined_text, "Play-again prompt never appeared"
+    print("[OK] Match completed and the play-again prompt appeared")
+
+    # Decline -- with only this one human in the game, "no" means
+    # nobody stays, so the server ends and the connection drops,
+    # surfacing the real exit prompt (the earlier "Press Enter to
+    # close", right after GAME OVER, gets functionally superseded by
+    # the play-again prompt, by design).
+    already_seen = len(captured)
+    try:
+        proc.stdin.write("no\n")
+        proc.stdin.flush()
+    except (BrokenPipeError, OSError):
+        pass
+
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if any("Server closed the connection" in line for line in captured[already_seen:]):
+            break
+        time.sleep(0.2)
+    assert any("Server closed the connection" in line for line in captured[already_seen:]), (
+        "Declining play-again never led to the connection-lost message"
+    )
+    print("[OK] Declining play-again led to the connection dropping and a real exit prompt")
 
     # This is the actual fix under test.
     try:

@@ -61,7 +61,7 @@ from . import protocol
 from . import bot_logic
 from .constants import (
     MIN_PLAYERS, DISCUSSION_TIMEOUT, VOTE_TIMEOUT, NIGHT_ACTION_TIMEOUT,
-    BOT_NAME_POOL,
+    PLAY_AGAIN_TIMEOUT, BOT_NAME_POOL,
 )
 from .roles import Role, Alignment, build_role_assignments, ROLE_DESCRIPTIONS
 from .player import Player
@@ -91,12 +91,21 @@ def _match_option(raw: Optional[str], options: list) -> Optional[str]:
 
 class GameServer:
     def __init__(self, host="0.0.0.0", port=5555, target_bots=0,
-                 min_players=MIN_PLAYERS, auto_start=False):
+                 min_players=MIN_PLAYERS, auto_start=False,
+                 discussion_timeout=None, vote_timeout=None, night_action_timeout=None):
         self.host = host
         self.port = port
         self.target_bots = target_bots
         self.min_players = min_players
         self.auto_start = auto_start
+
+        # Per-instance timers, configurable by the host at lobby
+        # creation (see run_server.py) instead of being fixed globally.
+        # None means "use the constants.py default".
+        self.discussion_timeout = discussion_timeout if discussion_timeout is not None else DISCUSSION_TIMEOUT
+        self.vote_timeout = vote_timeout if vote_timeout is not None else VOTE_TIMEOUT
+        self.night_action_timeout = (night_action_timeout if night_action_timeout is not None
+                                      else NIGHT_ACTION_TIMEOUT)
 
         self.lock = threading.Lock()
         self.players: list[Player] = []
@@ -415,6 +424,11 @@ class GameServer:
 
     def _run_game(self):
         self.started = True
+        self._play_one_match()
+        while self._offer_play_again():
+            self._play_one_match()
+
+    def _play_one_match(self):
         gs = GameState(players=self.players)
         self.game_state = gs
 
@@ -440,6 +454,107 @@ class GameServer:
             if winner:
                 self._end_game(gs, winner)
                 return
+
+    def _offer_play_again(self) -> bool:
+        """
+        Asks every connected human whether they want to play again.
+        Anyone who says no, doesn't answer in time, or is disconnected
+        is replaced by a freshly-named bot for the next match, keeping
+        the total player count the same as the match that just ended
+        (so min_players stays satisfied automatically). Bots always
+        continue -- they have no opinion to ask.
+
+        Returns True if there's a next match to play (at least one
+        human wants to continue), False if the server should end.
+        """
+        gs = self.game_state
+        human_players = [p for p in gs.players if not p.is_bot]
+        bot_players = [p for p in gs.players if p.is_bot]
+
+        if not human_players:
+            return False  # nobody left to ask -- don't auto-replay a bots-only game
+
+        for p in human_players:
+            self._send_private(p, {"type": "play_again_prompt", "timeout": PLAY_AGAIN_TIMEOUT})
+
+        results = {}
+        threads = []
+        for p in human_players:
+            def collect_for(p=p):
+                results[p.id] = self._collect_action(
+                    p, PLAY_AGAIN_TIMEOUT, "play_again",
+                    lambda v: v is not None and v.strip().lower() in ("yes", "y", "no", "n"),
+                    lambda *_: None, gs,  # never a bot -- no bot path needed
+                )
+            t = threading.Thread(target=collect_for, daemon=True)
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join(timeout=PLAY_AGAIN_TIMEOUT + 3)
+
+        staying, leaving = [], []
+        for p in human_players:
+            answer = (results.get(p.id) or "").strip().lower()
+            (staying if answer in ("yes", "y") else leaving).append(p)
+
+        for p in leaving:
+            self._send_private(p, {
+                "type": "info",
+                "text": "You'll sit out the next match -- a bot will take your place. "
+                        "Thanks for playing!",
+            })
+            if p.connected and p.conn:
+                # shutdown() before close(): this connection's reader
+                # thread is very likely still blocked inside recv() on
+                # this same socket right now, and a plain close() from
+                # a different thread isn't reliably enough to unblock
+                # it or guarantee the peer sees a clean EOF. shutdown()
+                # is the standard fix for closing a socket out from
+                # under a thread that's concurrently reading it.
+                try:
+                    p.conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    p.conn.close()
+                except OSError:
+                    pass
+                p.connected = False
+
+        if not staying:
+            return False
+
+        continuing = staying + bot_players
+        for p in continuing:
+            p.role = None
+            p.true_alignment = None
+            p.apparent_alignment = None
+            p.alive = True
+            p.saboteur_used = False
+            p.known_mafia_id = None
+            p.active_prompt = None
+            p.active_prompt_deadline = None
+            # id, name, conn, connected, rejoin_token all carry over unchanged
+
+        used_names = {p.name for p in continuing}
+        available = [n for n in BOT_NAME_POOL if n not in used_names]
+        random.shuffle(available)
+        new_bots = []
+        for i in range(len(leaving)):
+            bot_name = available[i] if i < len(available) else f"Bot_{i + 1}_r"
+            new_bots.append(Player(id=bot_name, name=bot_name, is_bot=True))
+
+        with self.lock:
+            self.players = continuing + new_bots
+
+        print(f"[SERVER] Starting a new match with {len(self.players)} players "
+              f"({len(staying)} staying, {len(new_bots)} new bot(s) replacing "
+              f"{len(leaving)} player(s) who didn't continue).")
+        self._broadcast({
+            "type": "info",
+            "text": f"Starting a new match with {len(self.players)} players...",
+        }, players=staying)
+        return True
 
     def _announce_roles(self, gs):
         for p in gs.players:
@@ -511,12 +626,12 @@ class GameServer:
         if detective:
             self._send_prompt(detective, {
                 "type": "prompt", "prompt_type": "night_action", "action": "investigate",
-                "timeout": NIGHT_ACTION_TIMEOUT, "options": detective_options,
-            }, NIGHT_ACTION_TIMEOUT)
+                "timeout": self.night_action_timeout, "options": detective_options,
+            }, self.night_action_timeout)
 
             def collect_detective():
                 results["detective"] = self._collect_action(
-                    detective, NIGHT_ACTION_TIMEOUT, "night_action",
+                    detective, self.night_action_timeout, "night_action",
                     lambda v: _match_option(v, detective_options) is not None,
                     bot_logic.bot_investigate_target, gs,
                 )
@@ -526,12 +641,12 @@ class GameServer:
         if mafia_actor:
             self._send_prompt(mafia_actor, {
                 "type": "prompt", "prompt_type": "night_action", "action": "kill",
-                "timeout": NIGHT_ACTION_TIMEOUT, "options": mafia_options,
-            }, NIGHT_ACTION_TIMEOUT)
+                "timeout": self.night_action_timeout, "options": mafia_options,
+            }, self.night_action_timeout)
 
             def collect_mafia():
                 results["mafia"] = self._collect_action(
-                    mafia_actor, NIGHT_ACTION_TIMEOUT, "night_action",
+                    mafia_actor, self.night_action_timeout, "night_action",
                     lambda v: _match_option(v, mafia_options) is not None,
                     bot_logic.bot_kill_target, gs,
                 )
@@ -541,12 +656,12 @@ class GameServer:
         if doctor:
             self._send_prompt(doctor, {
                 "type": "prompt", "prompt_type": "night_action", "action": "protect",
-                "timeout": NIGHT_ACTION_TIMEOUT, "options": doctor_options,
-            }, NIGHT_ACTION_TIMEOUT)
+                "timeout": self.night_action_timeout, "options": doctor_options,
+            }, self.night_action_timeout)
 
             def collect_doctor():
                 results["doctor"] = self._collect_action(
-                    doctor, NIGHT_ACTION_TIMEOUT, "night_action",
+                    doctor, self.night_action_timeout, "night_action",
                     lambda v: _match_option(v, doctor_options) is not None,
                     bot_logic.bot_protect_target, gs,
                 )
@@ -556,12 +671,12 @@ class GameServer:
         if saboteur_active:
             self._send_prompt(saboteur, {
                 "type": "prompt", "prompt_type": "sabotage_decision",
-                "timeout": NIGHT_ACTION_TIMEOUT, "options": saboteur_options,
-            }, NIGHT_ACTION_TIMEOUT)
+                "timeout": self.night_action_timeout, "options": saboteur_options,
+            }, self.night_action_timeout)
 
             def collect_saboteur():
                 results["saboteur"] = self._collect_action(
-                    saboteur, NIGHT_ACTION_TIMEOUT, "sabotage_decision",
+                    saboteur, self.night_action_timeout, "sabotage_decision",
                     lambda v: _match_option(v, saboteur_options) is not None,
                     lambda *_: None, gs,  # Saboteur is always human -- no bot path
                 )
@@ -570,7 +685,7 @@ class GameServer:
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=NIGHT_ACTION_TIMEOUT + 3)
+            t.join(timeout=self.night_action_timeout + 3)
 
         # Night is over -- none of these prompts are still "active" for
         # reconnect-resend purposes, whether or not each role answered.
@@ -653,7 +768,7 @@ class GameServer:
         print(f"[SERVER] === DAY {gs.round_number}: discussion ===")
         self._broadcast({
             "type": "phase", "name": "DISCUSSION", "round": gs.round_number,
-            "timeout": DISCUSSION_TIMEOUT,
+            "timeout": self.discussion_timeout,
             "alive_players": [p.name for p in gs.alive_players()],
         })
         self._run_discussion(gs)
@@ -661,14 +776,14 @@ class GameServer:
         gs.phase = "VOTING"
         print(f"[SERVER] === DAY {gs.round_number}: voting ===")
         self._broadcast({"type": "phase", "name": "VOTING", "round": gs.round_number,
-                          "timeout": VOTE_TIMEOUT})
+                          "timeout": self.vote_timeout})
         self._run_voting(gs)
 
     def _run_discussion(self, gs):
         alive_bots = [p for p in gs.alive_players() if p.is_bot]
         stop_event = threading.Event()
-        high = max(3, DISCUSSION_TIMEOUT - 5)
-        gs.discussion_deadline = time.time() + DISCUSSION_TIMEOUT
+        high = max(3, self.discussion_timeout - 5)
+        gs.discussion_deadline = time.time() + self.discussion_timeout
 
         def bot_talk(bot):
             time.sleep(random.uniform(2, high))
@@ -683,7 +798,7 @@ class GameServer:
         threads = [threading.Thread(target=bot_talk, args=(b,), daemon=True) for b in alive_bots]
         for t in threads:
             t.start()
-        time.sleep(DISCUSSION_TIMEOUT)
+        time.sleep(self.discussion_timeout)
         stop_event.set()
         gs.discussion_deadline = None
 
@@ -694,7 +809,7 @@ class GameServer:
 
         for p in alive:
             self._send_prompt(p, {"type": "prompt", "prompt_type": "vote",
-                                   "timeout": VOTE_TIMEOUT, "options": options}, VOTE_TIMEOUT)
+                                   "timeout": self.vote_timeout, "options": options}, self.vote_timeout)
         # Eliminated players don't get a vote prompt at all -- tell them
         # plainly why, rather than leaving them to wonder why nothing
         # is happening on their screen.
@@ -708,7 +823,7 @@ class GameServer:
 
         def collect_for(p):
             value = self._collect_action(
-                p, VOTE_TIMEOUT, "vote",
+                p, self.vote_timeout, "vote",
                 lambda v: _match_option(v, options) is not None,
                 bot_logic.bot_vote_target, gs,
             )
@@ -718,7 +833,7 @@ class GameServer:
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=VOTE_TIMEOUT + 3)
+            t.join(timeout=self.vote_timeout + 3)
 
         # Voting is over -- these prompts are no longer "active" for
         # reconnect-resend purposes, whether or not each player voted.
