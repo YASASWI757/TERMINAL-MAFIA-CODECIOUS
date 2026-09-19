@@ -32,6 +32,11 @@ class GameState:
 
     last_night_death: Optional[Player] = None
 
+    # Full match history: one entry per elimination, in order. Used to
+    # build the end-of-game summary sent to every player (not just the
+    # bare final role list).
+    elimination_log: List[Dict] = field(default_factory=list)
+
     def alive_players(self) -> List[Player]:
         return [p for p in self.players if p.alive]
 

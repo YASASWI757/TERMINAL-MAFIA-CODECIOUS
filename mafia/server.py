@@ -27,6 +27,14 @@ Concurrency model:
       SAME inbox a human's reader thread would have used -- so the
       collection code doesn't need to know or care whether it's
       waiting on a human or a bot.
+    - Night actions (Detective / Mafia / Doctor / Saboteur) are all
+      prompted and collected CONCURRENTLY, not one after another --
+      none of them need to see each other's choice before acting, so
+      running them sequentially only added dead-air waiting (e.g. the
+      Doctor's prompt not even appearing until Detective AND Mafia had
+      both finished, up to 2x the timeout of visible "nothing is
+      happening"). Only the final resolution step needs every action
+      already collected.
 
 Disconnect policy (Option A, decided during planning): a disconnected
 player is never removed or auto-eliminated. They stay "alive but idle"
@@ -34,6 +42,11 @@ player is never removed or auto-eliminated. They stay "alive but idle"
 abstain / no action) -- and can reconnect at any time using the same
 name, which re-attaches their existing Player object (and its role,
 alive status, etc.) to a new socket.
+
+Eliminated players stay connected as spectators: they keep receiving
+every broadcast (chat, phase changes, results, the final summary) but
+are excluded from voting/night-action prompts and from sending chat,
+and are told plainly why.
 """
 
 import socket
@@ -54,6 +67,25 @@ from .player import Player
 from .game_state import GameState
 from .night import run_investigation, resolve_night_kill
 from .voting import tally_votes, resolve_vote, check_win
+
+
+def _match_option(raw: Optional[str], options: list) -> Optional[str]:
+    """
+    Case-insensitive, whitespace-trimmed matching against a list of
+    valid option strings (player names, or keywords like 'abstain' /
+    'skip'). Returns the canonically-cased option on a unique match,
+    else None.
+
+    Exists because exact-case-only matching was a real source of
+    "I typed 'bob' and nothing happened" confusion during a live game
+    -- a player's target choice should never silently fail just
+    because of capitalization.
+    """
+    if raw is None:
+        return None
+    norm = raw.strip().lower()
+    matches = [o for o in options if o.lower() == norm]
+    return matches[0] if len(matches) == 1 else None
 
 
 class GameServer:
@@ -178,6 +210,13 @@ class GameServer:
             return
         if self.game_state.phase != "DISCUSSION":
             return
+        if not player.alive:
+            self._send_private(player, {
+                "type": "info",
+                "text": "You've been eliminated and can no longer speak in discussion "
+                        "-- you're spectating for the rest of the match.",
+            })
+            return
         text = text.strip()[:300]
         self._broadcast_chat(player.name, text)
         self.game_state.discussion_log.append((player.name, text))
@@ -235,10 +274,13 @@ class GameServer:
 
     def _collect_action(self, player, timeout, expected_type, validator, bot_fn, game_state):
         """
-        Returns a validated action value for `player`, or None if no
-        valid action arrived within `timeout` seconds (covers: player
-        never responds, player disconnected, player sent something
-        invalid and then ran out of time, or a bot found no legal move).
+        Returns a validated (RAW, as-typed) action value for `player`,
+        or None if nothing valid arrived within `timeout` seconds
+        (covers: player never responds, player disconnected, player
+        sent something invalid and then ran out of time, or a bot
+        found no legal move). Callers that need the canonical
+        (correctly-cased) name should re-run `_match_option` on the
+        returned value themselves.
 
         This function makes no distinction between "disconnected" and
         "connected but silent" -- both simply time out the same way,
@@ -336,6 +378,26 @@ class GameServer:
     def _find_alive(self, gs, role):
         return next((p for p in gs.alive_players() if p.role == role), None)
 
+    def _revealed_role_text(self, player) -> str:
+        return ("DOUBLE AGENT (secretly Mafia-aligned)"
+                if player.role == Role.DOUBLE_AGENT else player.role.value)
+
+    def _notify_eliminated(self, gs, player, cause: str):
+        """
+        A clear, first-person, unmistakable notice sent directly to a
+        player the moment THEY are the one eliminated -- distinct from
+        the public third-person death announcement, so there's no
+        ambiguity about what just happened to them or what they can
+        still do.
+        """
+        self._send_private(player, {
+            "type": "eliminated",
+            "cause": cause,  # "NIGHT" or "VOTE"
+            "text": f"\U0001F480 You were eliminated ({cause.lower()}). "
+                    f"You can no longer vote or take night actions, but you'll "
+                    f"keep seeing everything that happens as a spectator.",
+        })
+
     # ---- NIGHT ----
 
     def _night_phase(self, gs):
@@ -351,22 +413,88 @@ class GameServer:
         mafia_actor = self._find_alive(gs, Role.MAFIA) or self._find_alive(gs, Role.DOUBLE_AGENT)
         doctor = self._find_alive(gs, Role.DOCTOR)
         saboteur = self._find_alive(gs, Role.SABOTEUR)
+        saboteur_active = saboteur and not saboteur.saboteur_used
 
         def alive_names_except(exclude_id):
             return [p.name for p in gs.alive_players() if p.id != exclude_id]
 
-        # 1. Detective investigates (read-only, resolves first)
+        # All four night roles are prompted and collected AT THE SAME
+        # TIME -- none of them need to see another's choice before
+        # acting, so there's no reason to make one wait on another.
+        # Only the final resolution step (below) needs everyone's
+        # answer already in hand.
+        results = {}
+        threads = []
+
+        detective_options = alive_names_except(detective.id) if detective else []
         if detective:
-            options = alive_names_except(detective.id)
             self._send_private(detective, {
                 "type": "prompt", "prompt_type": "night_action", "action": "investigate",
-                "timeout": NIGHT_ACTION_TIMEOUT, "options": options,
+                "timeout": NIGHT_ACTION_TIMEOUT, "options": detective_options,
             })
-            target_name = self._collect_action(
-                detective, NIGHT_ACTION_TIMEOUT, "night_action",
-                lambda v: v in options,
-                bot_logic.bot_investigate_target, gs,
-            )
+
+            def collect_detective():
+                results["detective"] = self._collect_action(
+                    detective, NIGHT_ACTION_TIMEOUT, "night_action",
+                    lambda v: _match_option(v, detective_options) is not None,
+                    bot_logic.bot_investigate_target, gs,
+                )
+            threads.append(threading.Thread(target=collect_detective, daemon=True))
+
+        mafia_options = alive_names_except(mafia_actor.id) if mafia_actor else []
+        if mafia_actor:
+            self._send_private(mafia_actor, {
+                "type": "prompt", "prompt_type": "night_action", "action": "kill",
+                "timeout": NIGHT_ACTION_TIMEOUT, "options": mafia_options,
+            })
+
+            def collect_mafia():
+                results["mafia"] = self._collect_action(
+                    mafia_actor, NIGHT_ACTION_TIMEOUT, "night_action",
+                    lambda v: _match_option(v, mafia_options) is not None,
+                    bot_logic.bot_kill_target, gs,
+                )
+            threads.append(threading.Thread(target=collect_mafia, daemon=True))
+
+        doctor_options = [p.name for p in gs.alive_players()] if doctor else []
+        if doctor:
+            self._send_private(doctor, {
+                "type": "prompt", "prompt_type": "night_action", "action": "protect",
+                "timeout": NIGHT_ACTION_TIMEOUT, "options": doctor_options,
+            })
+
+            def collect_doctor():
+                results["doctor"] = self._collect_action(
+                    doctor, NIGHT_ACTION_TIMEOUT, "night_action",
+                    lambda v: _match_option(v, doctor_options) is not None,
+                    bot_logic.bot_protect_target, gs,
+                )
+            threads.append(threading.Thread(target=collect_doctor, daemon=True))
+
+        saboteur_options = alive_names_except(saboteur.id) + ["skip"] if saboteur_active else []
+        if saboteur_active:
+            self._send_private(saboteur, {
+                "type": "prompt", "prompt_type": "sabotage_decision",
+                "timeout": NIGHT_ACTION_TIMEOUT, "options": saboteur_options,
+            })
+
+            def collect_saboteur():
+                results["saboteur"] = self._collect_action(
+                    saboteur, NIGHT_ACTION_TIMEOUT, "sabotage_decision",
+                    lambda v: _match_option(v, saboteur_options) is not None,
+                    lambda *_: None, gs,  # Saboteur is always human -- no bot path
+                )
+            threads.append(threading.Thread(target=collect_saboteur, daemon=True))
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=NIGHT_ACTION_TIMEOUT + 3)
+
+        # ---- Process each result now that all are in ----
+
+        if detective and results.get("detective"):
+            target_name = _match_option(results["detective"], detective_options)
             if target_name:
                 target = gs.get_player_by_name(target_name)
                 result = run_investigation(target)
@@ -379,19 +507,9 @@ class GameServer:
                         "text": f"{target.name} is {result.value}-ALIGNED.",
                     })
 
-        # 2. Mafia (or a stand-in Double Agent) chooses the kill target
         mafia_target = None
-        if mafia_actor:
-            options = alive_names_except(mafia_actor.id)
-            self._send_private(mafia_actor, {
-                "type": "prompt", "prompt_type": "night_action", "action": "kill",
-                "timeout": NIGHT_ACTION_TIMEOUT, "options": options,
-            })
-            target_name = self._collect_action(
-                mafia_actor, NIGHT_ACTION_TIMEOUT, "night_action",
-                lambda v: v in options,
-                bot_logic.bot_kill_target, gs,
-            )
+        if mafia_actor and results.get("mafia"):
+            target_name = _match_option(results["mafia"], mafia_options)
             if target_name:
                 mafia_target = gs.get_player_by_name(target_name)
                 double_agent = self._find_alive(gs, Role.DOUBLE_AGENT)
@@ -401,34 +519,14 @@ class GameServer:
                         "text": f"[Mafia] Tonight's target: {mafia_target.name}",
                     })
 
-        # 3. Doctor protects (self-protection allowed, no cooldown)
         doctor_target = None
-        if doctor:
-            options = [p.name for p in gs.alive_players()]
-            self._send_private(doctor, {
-                "type": "prompt", "prompt_type": "night_action", "action": "protect",
-                "timeout": NIGHT_ACTION_TIMEOUT, "options": options,
-            })
-            target_name = self._collect_action(
-                doctor, NIGHT_ACTION_TIMEOUT, "night_action",
-                lambda v: v in options,
-                bot_logic.bot_protect_target, gs,
-            )
+        if doctor and results.get("doctor"):
+            target_name = _match_option(results["doctor"], doctor_options)
             if target_name:
                 doctor_target = gs.get_player_by_name(target_name)
 
-        # 4. Saboteur arms a vote-nullify for tomorrow (human-only role)
-        if saboteur and not saboteur.saboteur_used:
-            options = alive_names_except(saboteur.id)
-            self._send_private(saboteur, {
-                "type": "prompt", "prompt_type": "sabotage_decision",
-                "timeout": NIGHT_ACTION_TIMEOUT, "options": options,
-            })
-            decision = self._collect_action(
-                saboteur, NIGHT_ACTION_TIMEOUT, "sabotage_decision",
-                lambda v: v == "skip" or v in options,
-                lambda *_: None, gs,  # Saboteur is always human -- no bot path
-            )
+        if saboteur_active and results.get("saboteur"):
+            decision = _match_option(results["saboteur"], saboteur_options)
             if decision and decision != "skip":
                 target = gs.get_player_by_name(decision)
                 gs.sabotage_armed = target.id
@@ -438,11 +536,16 @@ class GameServer:
                     "text": f"Sabotage armed on {target.name} for tomorrow's vote.",
                 })
 
-        # 5. Resolve
+        # ---- Resolve the kill ----
         death = resolve_night_kill(mafia_target, doctor_target)
         if death:
             death.alive = False
             print(f"[SERVER] {death.name} ({death.role.value}) was eliminated at night.")
+            gs.elimination_log.append({
+                "round": gs.round_number, "phase": "NIGHT",
+                "player": death.name, "role": self._revealed_role_text(death),
+            })
+            self._notify_eliminated(gs, death, "NIGHT")
         else:
             print("[SERVER] No one died last night.")
         gs.last_night_death = death
@@ -453,9 +556,8 @@ class GameServer:
         gs.phase = "ANNOUNCE"
         if gs.last_night_death:
             d = gs.last_night_death
-            reveal = ("DOUBLE AGENT (secretly Mafia-aligned)"
-                      if d.role == Role.DOUBLE_AGENT else d.role.value)
-            self._broadcast({"type": "death_announcement", "player": d.name, "role": reveal})
+            self._broadcast({"type": "death_announcement", "player": d.name,
+                              "role": self._revealed_role_text(d)})
         else:
             self._broadcast({"type": "death_announcement", "player": None, "role": None})
 
@@ -497,18 +599,27 @@ class GameServer:
 
     def _run_voting(self, gs):
         alive = gs.alive_players()
+        dead_humans = [p for p in gs.players if not p.alive and not p.is_bot]
         options = [p.name for p in alive] + ["abstain"]
 
         for p in alive:
             self._send_private(p, {"type": "prompt", "prompt_type": "vote",
                                     "timeout": VOTE_TIMEOUT, "options": options})
+        # Eliminated players don't get a vote prompt at all -- tell them
+        # plainly why, rather than leaving them to wonder why nothing
+        # is happening on their screen.
+        for p in dead_humans:
+            self._send_private(p, {
+                "type": "info",
+                "text": "You're eliminated and can't vote -- watching as a spectator.",
+            })
 
         results = {}
 
         def collect_for(p):
             value = self._collect_action(
                 p, VOTE_TIMEOUT, "vote",
-                lambda v: v in options,
+                lambda v: _match_option(v, options) is not None,
                 bot_logic.bot_vote_target, gs,
             )
             results[p.id] = value
@@ -521,7 +632,7 @@ class GameServer:
 
         votes = {}
         for p in alive:
-            chosen_name = results.get(p.id)
+            chosen_name = _match_option(results.get(p.id), options)
             if chosen_name is None or chosen_name == "abstain":
                 votes[p.id] = None
             else:
@@ -539,20 +650,21 @@ class GameServer:
             eliminated_player = gs.get_player(eliminated_id)
             eliminated_player.alive = False
             print(f"[SERVER] {eliminated_player.name} ({eliminated_player.role.value}) voted out.")
+            gs.elimination_log.append({
+                "round": gs.round_number, "phase": "DAY VOTE",
+                "player": eliminated_player.name,
+                "role": self._revealed_role_text(eliminated_player),
+            })
+            self._notify_eliminated(gs, eliminated_player, "VOTE")
         else:
             print("[SERVER] No majority -- no one eliminated.")
-
-        eliminated_role_text = None
-        if eliminated_player:
-            eliminated_role_text = ("DOUBLE AGENT (secretly Mafia-aligned)"
-                                     if eliminated_player.role == Role.DOUBLE_AGENT
-                                     else eliminated_player.role.value)
 
         self._broadcast({
             "type": "vote_results",
             "tally": counts_by_name,
             "eliminated": eliminated_player.name if eliminated_player else None,
-            "eliminated_role": eliminated_role_text,
+            "eliminated_role": (self._revealed_role_text(eliminated_player)
+                                 if eliminated_player else None),
         })
 
     # ---- END ----
@@ -560,8 +672,17 @@ class GameServer:
     def _end_game(self, gs, winner):
         reveal = [{"name": p.name, "role": p.role.value, "alive": p.alive} for p in gs.players]
         gs.phase = "GAME_OVER"
-        self._broadcast({"type": "game_over", "winner": winner, "reveal": reveal})
-        print(f"\n[SERVER] ===== GAME OVER -- {winner} WIN =====")
+        self._broadcast({
+            "type": "game_over",
+            "winner": winner,
+            "rounds_played": gs.round_number,
+            "elimination_log": gs.elimination_log,
+            "reveal": reveal,
+        })
+        print(f"\n[SERVER] ===== GAME OVER -- {winner} WIN ({gs.round_number} rounds) =====")
+        for entry in gs.elimination_log:
+            print(f"   Round {entry['round']} [{entry['phase']}]: "
+                  f"{entry['player']} -- {entry['role']}")
         for p in gs.players:
             tag = " (bot)" if p.is_bot else ""
             status = "alive" if p.alive else "dead"

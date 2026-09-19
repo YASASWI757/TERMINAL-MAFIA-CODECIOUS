@@ -202,6 +202,11 @@ python -m unittest tests.test_engine -v
 
 # Full networked game, played start-to-finish over real sockets
 python tests/test_integration_headless.py
+
+# Targeted checks for the post-playtest fixes (case-insensitive
+# matching, elimination_log, personal eliminated/can't-vote notices,
+# and a timing check proving the night phase runs concurrently)
+python tests/verify_fixes.py
 ```
 
 Both suites are included in this repo and pass as of this commit.
@@ -215,6 +220,62 @@ correct final reveal — proving the networking/threading/timeout
 plumbing works end-to-end, not just the logic in isolation.
 
 ---
+
+## Fixes since first draft
+
+Found and fixed during hands-on playtesting:
+
+- **Countdown timer.** Every timed prompt (discussion / vote / night
+  action / sabotage decision) now shows a live countdown on the
+  client, with reminders at the halfway point and in the final
+  seconds. It's checkpoint-based (not a literal per-second redraw) --
+  see the text-overlap fix below for why that's the deliberate,
+  correct call here, not a shortcut.
+- **Full game-over summary to everyone.** `game_over` now includes
+  `rounds_played` and a round-by-round `elimination_log` (who died,
+  which phase, their revealed role), broadcast to every connected
+  player -- dead or alive -- not just a bare final role list.
+- **Eliminated players are told, clearly, that they can't vote.** A
+  player who's just died gets an unmistakable first-person notice
+  distinct from the public death announcement ("You were eliminated
+  -- you can no longer vote or act, but you'll keep seeing what
+  happens"), and if the match continues, they get an explicit
+  reminder at the start of the next vote instead of silence. They're
+  also blocked from sending chat during discussion once dead (with an
+  explanation), closing a related gap where eliminated players could
+  otherwise keep talking as if still alive.
+- **The "Doctor/killer" lag.** Root cause: Detective, Mafia, Doctor,
+  and Saboteur were being prompted **sequentially** -- the Doctor's
+  prompt didn't even appear until Detective *and* Mafia had both
+  finished responding, so it could look hung or laggy for up to 2-3x
+  `NIGHT_ACTION_TIMEOUT` before Doctor saw anything. None of these
+  roles need to see another's choice before acting, so they're now
+  all prompted and collected **concurrently** (same pattern already
+  used for voting) -- the whole night phase now takes roughly one
+  timeout window, not a sum of four. Verified via `tests/verify_fixes.py`,
+  which times the phase directly.
+
+  A second, related bug found while root-causing this: target names
+  were matched with **exact-case string equality**, so typing `bob`
+  for a player named `Bob` was silently rejected as "invalid input" --
+  easy to hit live and easy to mistake for the game being broken.
+  Fixed with case-insensitive, whitespace-trimmed matching everywhere
+  a target/vote/sabotage choice is parsed.
+- **Text overlap between input and output.** Root cause: the listener
+  thread (printing incoming chat/server messages) and the main thread
+  (blocked in `input()` reading what you're typing) were writing to
+  the terminal with no coordination, so an incoming message could
+  visually clobber a line you were mid-typing. Fixed with a
+  thread-safe `safe_print()` used everywhere, which -- on Unix/Mac
+  terminals with GNU readline (the default for `input()` there) --
+  clears the current line, prints the incoming message, then redraws
+  whatever you'd already typed so you can keep going without losing
+  your place. This is also *why* the countdown is checkpoint-based
+  rather than a per-second live tick: a tick fighting for the same
+  line every second would reintroduce exactly this problem instead of
+  fixing it. On Windows (no `readline` by default), it falls back to
+  plain sequential printing -- the overlap risk is a bit higher there,
+  but nothing crashes or corrupts input.
 
 ## Known design decisions worth knowing about (not bugs)
 
