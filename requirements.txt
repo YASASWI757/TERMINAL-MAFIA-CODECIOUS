@@ -1,0 +1,8 @@
+# Terminal Mafia has zero external dependencies -- it runs on the
+# Python standard library alone (socket, threading, queue, json,
+# dataclasses, enum, argparse, random, time).
+#
+# Requires Python 3.9+.
+#
+# Nothing to pip install. This file exists so tooling/judges that
+# expect a requirements.txt find one and see that intentionally.
