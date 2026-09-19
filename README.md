@@ -252,6 +252,18 @@ plumbing works end-to-end, not just the logic in isolation.
 
 ---
 
+## Lobby screen
+
+Before the match starts, connecting players see a proper title screen
+instead of a bare log: a hand-built block-letter "TERMINAL MAFIA"
+banner, a tagline, a double-line separator, a bordered frame, and a
+live "Players connected: X / Y" list that updates as people join --
+something the game genuinely didn't have before (connected players
+previously had zero visibility into who else had joined pre-game; the
+server only ever printed that to its own console). Curses-only, same
+scope as the other visual touches; the plain-text fallback client
+keeps its existing simple "Connected as X. Waiting..." line.
+
 ## Reconnect security
 
 Reconnecting used to be matched by name alone -- which meant anyone
@@ -279,6 +291,14 @@ to scroll back through the log to remember who's already out and what
 they were.
 
 ## Death animation
+
+Doctor saves are handled correctly here: the animation only fires
+when `death_announcement`'s `player` field is non-null, and a
+successful save (like "no Mafia target chosen") sends `player: null`
+-- so a protected player never triggers it, and the client just logs
+"No one died last night." (Confirmed by re-reading the single call
+site rather than assuming -- there's exactly one, and it's already
+correctly guarded.)
 
 When a night kill happens, the curses client plays a short (~1.5s)
 in-place ASCII beat before the "X was found dead... they were ROLE!"

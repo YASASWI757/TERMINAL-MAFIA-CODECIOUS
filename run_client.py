@@ -118,6 +118,25 @@ DEATH_ANIMATION_FRAMES = [
 DEATH_ANIMATION_FRAME_DELAY = 0.28  # seconds per frame
 
 
+# Hand-built 5-row block-letter banner (generated once with a small
+# script for guaranteed column alignment, then baked in as a constant
+# here -- same approach as the death animation frames). Shown on the
+# lobby screen before the game starts.
+TITLE_BANNER = [
+    "\u2588\u2588\u2588\u2588\u2588 \u2588\u2588\u2588\u2588\u2588 \u2588\u2588\u2588\u2588  \u2588   \u2588 \u2588\u2588\u2588\u2588\u2588 \u2588   \u2588  \u2588\u2588\u2588  \u2588",
+    "  \u2588   \u2588     \u2588   \u2588 \u2588\u2588 \u2588\u2588   \u2588   \u2588\u2588  \u2588 \u2588   \u2588 \u2588",
+    "  \u2588   \u2588\u2588\u2588\u2588  \u2588\u2588\u2588\u2588  \u2588 \u2588 \u2588   \u2588   \u2588 \u2588 \u2588 \u2588\u2588\u2588\u2588\u2588 \u2588",
+    "  \u2588   \u2588     \u2588  \u2588  \u2588   \u2588   \u2588   \u2588  \u2588\u2588 \u2588   \u2588 \u2588",
+    "  \u2588   \u2588\u2588\u2588\u2588\u2588 \u2588   \u2588 \u2588   \u2588 \u2588\u2588\u2588\u2588\u2588 \u2588   \u2588 \u2588   \u2588 \u2588\u2588\u2588\u2588\u2588",
+    "         \u2588   \u2588  \u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588 \u2588\u2588\u2588\u2588\u2588  \u2588\u2588\u2588",
+    "         \u2588\u2588 \u2588\u2588 \u2588   \u2588 \u2588       \u2588   \u2588   \u2588",
+    "         \u2588 \u2588 \u2588 \u2588\u2588\u2588\u2588\u2588 \u2588\u2588\u2588\u2588    \u2588   \u2588\u2588\u2588\u2588\u2588",
+    "         \u2588   \u2588 \u2588   \u2588 \u2588       \u2588   \u2588   \u2588",
+    "         \u2588   \u2588 \u2588   \u2588 \u2588     \u2588\u2588\u2588\u2588\u2588 \u2588   \u2588",
+]
+TAGLINE = "deception \u00b7 deduction \u00b7 survival"
+
+
 # ======================================================================
 # Curses UI (primary experience -- Linux / Mac, or Windows with
 # `windows-curses` installed)
@@ -149,6 +168,14 @@ class ClientUI:
         self.countdown_label = ""
         self.running = True
         self.game_ended = False  # True once game_over has been received
+
+        # Lobby screen state -- shown until the game actually starts
+        # (the first role_assigned message flips this off).
+        self.in_lobby = True
+        self.lobby_connected = 0
+        self.lobby_needed = 0
+        self.lobby_target_bots = 0
+        self.lobby_players = []
 
     # ---- lifecycle ----
 
@@ -244,6 +271,78 @@ class ClientUI:
         self.countdown_deadline = None
         self.countdown_label = ""
 
+    # ---- lobby screen ----
+
+    def _draw_lobby(self):
+        h, w = self.stdscr.getmaxyx()
+        self.stdscr.erase()
+
+        def put_centered(row, text, attr=curses.A_NORMAL):
+            if row < 0 or row >= h:
+                return
+            col = max(2, (w - len(text)) // 2)
+            try:
+                self.stdscr.addnstr(row, col, text, max(0, w - col - 2), attr)
+            except curses.error:
+                pass
+
+        def put_left(row, text, indent=4, attr=curses.A_NORMAL):
+            if row < 0 or row >= h:
+                return
+            try:
+                self.stdscr.addnstr(row, indent, text, max(0, w - indent - 2), attr)
+            except curses.error:
+                pass
+
+        def border_row(row):
+            if row < 0 or row >= h or w < 2:
+                return
+            try:
+                self.stdscr.addstr(row, 0, "\u2551")
+                self.stdscr.addstr(row, w - 1, "\u2551")
+            except curses.error:
+                pass
+
+        row = 1
+        for line in TITLE_BANNER:
+            put_centered(row, line, curses.A_BOLD)
+            row += 1
+        row += 1
+        put_centered(row, TAGLINE)
+        row += 2
+
+        sep = "\u2550" * max(0, w - 2)
+        try:
+            self.stdscr.addnstr(row, 1, sep, max(0, w - 2))
+        except curses.error:
+            pass
+        row += 2
+
+        put_left(row, "LOBBY", attr=curses.A_BOLD)
+        row += 2
+
+        if self.lobby_target_bots:
+            status = (f"Players connected: {self.lobby_connected} / {self.lobby_needed} "
+                      f"({self.lobby_target_bots} bot(s) will fill the rest)")
+        else:
+            status = f"Players connected: {self.lobby_connected} / {self.lobby_needed}"
+        put_left(row, status)
+        row += 2
+
+        for p in self.lobby_players:
+            tag = " (bot)" if p["is_bot"] else ""
+            put_left(row, f"\u25cf {p['name']}{tag}")
+            row += 1
+            if row >= h - 3:
+                break
+
+        for r in range(0, min(row + 2, h)):
+            border_row(r)
+
+        put_left(min(h - 1, row + 1), "Waiting for the host to start the match...")
+
+        self.stdscr.refresh()
+
     # ---- log ----
 
     def _log(self, text):
@@ -321,10 +420,17 @@ class ClientUI:
             self._log(f"[SERVER] {msg['text']}")
             _save_token(self.name, msg.get("token"))
 
+        elif t == "lobby_update":
+            self.lobby_connected = msg["connected"]
+            self.lobby_needed = msg["needed"]
+            self.lobby_target_bots = msg["target_bots"]
+            self.lobby_players = msg["players"]
+
         elif t == "error":
             self._log(f"[ERROR] {msg['text']}")
 
         elif t == "role_assigned":
+            self.in_lobby = False
             self._log("=" * 50)
             self._log(f"YOUR ROLE: {msg['role']}")
             self._log(msg["description"])
@@ -435,6 +541,10 @@ class ClientUI:
     # ---- drawing ----
 
     def _draw(self):
+        if self.in_lobby:
+            self._draw_lobby()
+            return
+
         h, w = self.stdscr.getmaxyx()
         log_h = max(1, h - 3)
         wrap_width = max(10, w - 1)

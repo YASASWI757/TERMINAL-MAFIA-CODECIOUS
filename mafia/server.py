@@ -204,6 +204,7 @@ class GameServer:
         })
         if player.role is not None:
             self._send_state_snapshot(player)
+        self._broadcast_lobby_update()
 
         self._reader_loop(player)
 
@@ -324,6 +325,28 @@ class GameServer:
                 bot_name = available[i] if i < len(available) else f"Bot_{i + 1}"
                 self.players.append(Player(id=bot_name, name=bot_name, is_bot=True))
         print(f"[SERVER] Added {self.target_bots} bot player(s).")
+        self._broadcast_lobby_update()
+
+    def _broadcast_lobby_update(self):
+        """
+        Tells every connected human who else is in the lobby so far.
+        Without this, a joined player had no visibility into anyone
+        else who'd joined before the game started -- they'd just sit
+        there with no player list at all.
+        """
+        if self.started:
+            return
+        with self.lock:
+            players_snapshot = [{"name": p.name, "is_bot": p.is_bot} for p in self.players]
+        human_count = sum(1 for p in players_snapshot if not p["is_bot"])
+        humans_needed = max(0, self.min_players - self.target_bots)
+        self._broadcast({
+            "type": "lobby_update",
+            "connected": human_count,
+            "needed": humans_needed,
+            "target_bots": self.target_bots,
+            "players": players_snapshot,
+        })
 
     # ------------------------------------------------------------------
     # Action collection -- the single disconnect/timeout/invalid-input
