@@ -218,7 +218,10 @@ class GameServer:
             })
             return
         text = text.strip()[:300]
-        self._broadcast_chat(player.name, text)
+        # Sender is excluded here -- their own terminal already echoes
+        # what they typed, so sending it back would show it twice.
+        others = [p for p in self.players if p.id != player.id]
+        self._broadcast_chat(player.name, text, players=others)
         self.game_state.discussion_log.append((player.name, text))
         bot_logic.update_accusation_count(self.game_state, text)
 
@@ -235,8 +238,8 @@ class GameServer:
                 except OSError:
                     p.connected = False
 
-    def _broadcast_chat(self, sender, text):
-        self._broadcast({"type": "chat", "sender": sender, "text": text})
+    def _broadcast_chat(self, sender, text, players=None):
+        self._broadcast({"type": "chat", "sender": sender, "text": text}, players=players)
 
     def _send_private(self, player, msg):
         if player.is_bot or not player.connected or not player.conn:

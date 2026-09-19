@@ -207,6 +207,16 @@ python tests/test_integration_headless.py
 # matching, elimination_log, personal eliminated/can't-vote notices,
 # and a timing check proving the night phase runs concurrently)
 python tests/verify_fixes.py
+
+# Confirms the sender never receives their own chat message echoed back
+python tests/verify_no_echo.py
+
+# PTY-based smoke test for the curses client: runs it as a real
+# subprocess attached to a pseudo-terminal against a live server,
+# feeds it keystrokes across night/discussion/voting phases, and
+# checks it starts, draws a real screen, survives input, and shuts
+# down cleanly with no traceback
+python tests/verify_curses_client.py
 ```
 
 Both suites are included in this repo and pass as of this commit.
@@ -224,6 +234,48 @@ plumbing works end-to-end, not just the logic in isolation.
 ## Fixes since first draft
 
 Found and fixed during hands-on playtesting:
+
+- **Terminal UI rewritten around `curses`.** The earlier fix (a
+  thread-safe `safe_print` that cleared and redrew the input line) was
+  a mitigation, not a real fix -- it reduced corruption but couldn't
+  eliminate it, because Python's `input()` hands control to GNU
+  Readline, which keeps its own internal model of the screen; writing
+  to stdout from a background thread while `input()` is active happens
+  "behind Readline's back," so its next redraw is based on stale state.
+  This showed up worst during the long discussion window, where typing
+  a full sentence gave a countdown tick or an incoming chat line many
+  chances to land mid-keystroke.
+
+  The real fix: the client (`run_client.py`) now uses `curses` for a
+  proper split-screen layout -- a scrolling message log on top, a
+  pinned input line at the bottom, a live countdown status bar.
+  Curses fully owns the terminal and redraws deterministically every
+  frame from a single thread (the network listener thread only ever
+  pushes parsed messages onto a queue; it never touches the screen
+  directly), so there's no longer two independent things fighting over
+  the same line. This also means the countdown can now be a genuine
+  live per-second tick instead of the earlier checkpoint-only
+  compromise, since a live tick can no longer corrupt anything.
+
+  `curses` ships in the standard library on Linux and Mac, so this
+  doesn't cost the "zero external dependencies" pitch there. Stock
+  Windows Python doesn't include `curses`, so the client detects that
+  at import time and falls back automatically to the previous
+  line-based UI (fully playable, just without the split-screen layout
+  and live countdown) -- installing `windows-curses` on Windows gets
+  the full experience there too. `--no-curses` forces the fallback
+  manually if ever needed for a demo machine.
+
+- **Chat appeared twice for the sender.** Root cause: the server
+  broadcast every chat message to *all* connected players, including
+  whoever sent it -- so you'd see your own line once from your
+  terminal's normal typing echo, and a second time when the server's
+  broadcast came back to you. Fixed by excluding the sender from their
+  own chat broadcast (`_handle_chat` now broadcasts to everyone
+  *except* the player who sent it); the client now logs its own sent
+  message locally instead, so it still shows exactly once.
+
+## Fixes from the previous round (still in effect)
 
 - **Countdown timer.** Every timed prompt (discussion / vote / night
   action / sabotage decision) now shows a live countdown on the
