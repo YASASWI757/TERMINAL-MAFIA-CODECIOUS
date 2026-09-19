@@ -109,6 +109,7 @@ class ClientUI:
         self.countdown_deadline = None   # time.time() + seconds, or None
         self.countdown_label = ""
         self.running = True
+        self.game_ended = False  # True once game_over has been received
 
     # ---- lifecycle ----
 
@@ -158,6 +159,13 @@ class ClientUI:
     def _submit_input(self):
         line = self.input_buffer.strip()
         self.input_buffer = ""
+        if self.prompt_type == "exit":
+            # Bare Enter (empty input is normal here) confirms the user
+            # is done reading and lets the curses loop actually end, so
+            # curses.wrapper can call endwin() and hand the terminal
+            # back cleanly instead of spinning forever.
+            self.running = False
+            return
         if not line:
             return
         self._send_current(line)
@@ -247,8 +255,17 @@ class ClientUI:
         t = msg.get("type")
 
         if t == "_connection_lost":
-            self._log("[Connection lost -- the server may have ended, or your network "
-                      "dropped. Re-run this command with the same --name to reconnect.]")
+            if self.game_ended:
+                # Expected: the server process exits once the match is
+                # over, which closes the socket. Not an error -- don't
+                # show the "try reconnecting" warning for this case.
+                self._log("[Server closed the connection now that the match has ended.]")
+            else:
+                self._log("[Connection lost -- the server may have ended, or your network "
+                          "dropped. Re-run this command with the same --name to reconnect.]")
+            self.prompt_type = "exit"
+            self.prompt_hint = "Press Enter to close"
+            self._clear_countdown()
 
         elif t == "joined":
             self._log(f"[SERVER] {msg['text']}")
@@ -335,8 +352,7 @@ class ClientUI:
 
         elif t == "game_over":
             self._clear_countdown()
-            self.prompt_type = None
-            self.prompt_hint = "(game over)"
+            self.game_ended = True
             self._log("#" * 50)
             self._log(f"GAME OVER -- {msg['winner']} WIN! "
                       f"({msg.get('rounds_played', '?')} rounds played)")
@@ -352,6 +368,15 @@ class ClientUI:
                 status = "alive" if r["alive"] else "dead"
                 self._log(f"  {r['name']:20s} {r['role']:15s} ({status})")
             self._log("#" * 50)
+            self._log("")
+            self._log("Press Enter to close.")
+            # Deliberately NOT setting self.running = False here -- the
+            # player needs a moment to actually read the summary above.
+            # Enter (handled by _submit_input) is what ends the loop,
+            # which is what lets curses.wrapper restore the terminal
+            # cleanly instead of the screen staying frozen forever.
+            self.prompt_type = "exit"
+            self.prompt_hint = "Press Enter to close"
 
     # ---- drawing ----
 
@@ -570,6 +595,12 @@ def main():
     try:
         if _HAS_CURSES and not args.no_curses:
             _run_curses_client(sock, args.name)
+            # By the time this line runs, curses.wrapper has already
+            # called endwin() and restored the terminal to normal mode
+            # -- this print is plain confirmation of that for the user,
+            # since a screen that was previously stuck could otherwise
+            # leave them unsure whether it's actually back to normal.
+            print("Terminal restored. Goodbye!")
         else:
             _run_simple_client(sock, args.name)
     except KeyboardInterrupt:

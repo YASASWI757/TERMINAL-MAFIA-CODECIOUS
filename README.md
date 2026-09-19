@@ -217,6 +217,11 @@ python tests/verify_no_echo.py
 # checks it starts, draws a real screen, survives input, and shuts
 # down cleanly with no traceback
 python tests/verify_curses_client.py
+
+# Plays a real match to completion and confirms the client actually
+# exits on its own after "Press Enter to close" -- the fix for the
+# curses loop spinning forever and never restoring the terminal
+python tests/verify_clean_exit.py
 ```
 
 Both suites are included in this repo and pass as of this commit.
@@ -256,6 +261,24 @@ down):
 ```
 
 ## Fixes since first draft
+
+- **Curses client wasn't exiting after the game ended.** The main
+  loop's exit flag (`self.running`) was only ever set to `False` by
+  Ctrl+C -- nothing set it on `game_over` or on the connection closing
+  (which happens naturally once the server process exits after the
+  match ends). So the loop just kept spinning forever, `run()` never
+  returned, `curses.wrapper` never got to call `endwin()`, and the
+  terminal was never handed back to normal mode -- which is what a
+  screen full of stale/overlapping content after a match actually was:
+  a terminal stuck in raw curses mode with nothing left updating it
+  properly. Fixed with an explicit "Press Enter to close" prompt on
+  both `game_over` and on the connection dropping: the player gets a
+  moment to read the final summary, and pressing Enter is what now
+  actually ends the loop, restores the terminal, and prints a plain
+  "Terminal restored. Goodbye!" confirmation once it's back to normal.
+  Verified with a dedicated PTY test (`verify_clean_exit.py`) that
+  plays a real match to completion and asserts the process exits on
+  its own after Enter, with no SIGTERM needed.
 
 Found and fixed during hands-on playtesting:
 
