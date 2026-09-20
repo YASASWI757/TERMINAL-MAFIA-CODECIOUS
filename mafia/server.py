@@ -82,8 +82,8 @@ def _match_option(raw: Optional[str], options: list) -> Optional[str]:
     -- a player's target choice should never silently fail just
     because of capitalization.
     """
-    if raw is None:
-        return None
+    if not isinstance(raw, str):
+        return None  # wrong type entirely (e.g. a client sent an int) -- never a match
     norm = raw.strip().lower()
     matches = [o for o in options if o.lower() == norm]
     return matches[0] if len(matches) == 1 else None
@@ -163,7 +163,8 @@ class GameServer:
             conn.close()
             return
 
-        name = (first_msg.get("name") or "").strip()
+        raw_name = first_msg.get("name")
+        name = raw_name.strip()[:40] if isinstance(raw_name, str) else ""
         provided_token = first_msg.get("token")
         if not name:
             protocol.send_json(conn, {"type": "error", "text": "A name is required to join."})
@@ -171,16 +172,22 @@ class GameServer:
             return
 
         with self.lock:
-            existing = next((p for p in self.players if p.name == name and not p.connected), None)
+            # Matched by name alone (not "and not p.connected" as
+            # before) -- see the token-matches branch below for why:
+            # a rapid reconnect can legitimately arrive while the OLD
+            # connection is still marked connected, because TCP
+            # teardown isn't instantaneous relative to the client
+            # closing its socket. The old reader thread notices EOF
+            # and flips connected=False on its own schedule, not
+            # synchronously with the client-side close() call.
+            existing = next((p for p in self.players if p.name == name), None)
             if existing:
-                # Reconnect only succeeds if this connection can prove
-                # it's the same client that originally joined as this
-                # player -- matching on name alone would let anyone who
-                # knows (or just guesses) a disconnected player's name
-                # reconnect AS them and inherit their role, private
-                # info, and vote. The token is issued once on first
-                # join and never shown to anyone else.
-                if existing.rejoin_token is not None and provided_token != existing.rejoin_token:
+                token_matches = (existing.rejoin_token is not None
+                                  and provided_token == existing.rejoin_token)
+                if existing.connected and not token_matches:
+                    # Either someone else is genuinely using this name
+                    # right now, or this is a hijack attempt without
+                    # the right token -- reject either way.
                     protocol.send_json(conn, {
                         "type": "error",
                         "text": f"A player named '{name}' is already in this game, and this "
@@ -190,6 +197,42 @@ class GameServer:
                     })
                     conn.close()
                     return
+                if existing.rejoin_token is not None and provided_token != existing.rejoin_token:
+                    # existing.connected must be False to reach here
+                    # (the branch above already handled the True case)
+                    # -- this is the normal "reconnecting after a
+                    # detected disconnect, but with the wrong token"
+                    # hijack case. Matching on name alone would let
+                    # anyone who knows (or just guesses) a disconnected
+                    # player's name reconnect AS them and inherit their
+                    # role, private info, and vote. The token is issued
+                    # once on first join and never shown to anyone else.
+                    protocol.send_json(conn, {
+                        "type": "error",
+                        "text": f"A player named '{name}' is already in this game, and this "
+                                f"connection doesn't have their reconnect token. If this is "
+                                f"really you, run the client from the same folder you joined "
+                                f"from originally (it saves a token there for exactly this).",
+                    })
+                    conn.close()
+                    return
+                # Either existing.connected was already False (the
+                # normal case), or it was True but the matching token
+                # proves this is the same client reconnecting faster
+                # than the old connection's death was detected -- take
+                # over cleanly either way. shutdown() before close() on
+                # any still-open old socket, same reasoning as the
+                # play-again disconnect case: a reader thread may still
+                # be concurrently blocked reading on it.
+                if existing.conn is not None and existing.conn is not conn:
+                    try:
+                        existing.conn.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    try:
+                        existing.conn.close()
+                    except OSError:
+                        pass
                 existing.conn = conn
                 existing.connected = True
                 player = existing
@@ -197,10 +240,6 @@ class GameServer:
             else:
                 if self.started:
                     protocol.send_json(conn, {"type": "error", "text": "Game already in progress."})
-                    conn.close()
-                    return
-                if any(p.name == name for p in self.players):
-                    protocol.send_json(conn, {"type": "error", "text": "That name is already taken."})
                     conn.close()
                     return
                 player = Player(id=name, name=name, is_bot=False, conn=conn)
@@ -220,7 +259,18 @@ class GameServer:
     def _reader_loop(self, player):
         try:
             for msg in protocol.recv_lines(player.conn):
-                self._handle_incoming(player, msg)
+                # A single malformed/unexpected message from a client
+                # must never be able to kill this player's ENTIRE
+                # reader loop -- without this, one bad message (e.g. a
+                # non-string field value) would silently and
+                # permanently cut off their ability to send anything
+                # for the rest of the game, since nothing would be
+                # reading from their socket anymore. Log and keep
+                # going instead.
+                try:
+                    self._handle_incoming(player, msg)
+                except Exception as e:
+                    print(f"[SERVER] Ignored a malformed message from {player.name}: {e}")
         except (ConnectionError, OSError):
             pass
         finally:
@@ -240,7 +290,7 @@ class GameServer:
             player.inbox.put(msg)
 
     def _handle_chat(self, player, text):
-        if not text.strip() or self.game_state is None:
+        if not isinstance(text, str) or not text.strip() or self.game_state is None:
             return
         if self.game_state.phase != "DISCUSSION":
             return
@@ -281,7 +331,7 @@ class GameServer:
         """
         if player.alive:
             return  # a living player has no business here; ignore silently
-        if not text.strip() or self.game_state is None:
+        if not isinstance(text, str) or not text.strip() or self.game_state is None:
             return
         text = text.strip()[:300]
         gs = self.game_state
@@ -442,7 +492,21 @@ class GameServer:
             if msg.get("type") != expected_type:
                 continue  # stale/irrelevant message -- keep waiting
             value = msg.get("target")
-            if validator(value):
+            # A malformed value (wrong type -- e.g. an int where a
+            # name string was expected) must never crash this loop.
+            # Without this, an exception here would kill this specific
+            # collection thread entirely: results[player.id] would
+            # never get set, AND nothing would be reading player.inbox
+            # anymore for the rest of this call -- so even a genuinely
+            # valid follow-up answer sent right after would silently
+            # never be processed. Treating a validator exception the
+            # same as "returned False" keeps the loop alive to accept
+            # a real answer within the remaining time.
+            try:
+                is_valid = validator(value)
+            except Exception:
+                is_valid = False
+            if is_valid:
                 return value
             if not player.is_bot:
                 self._send_private(player, {

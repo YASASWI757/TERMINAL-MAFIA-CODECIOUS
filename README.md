@@ -263,6 +263,17 @@ python tests/verify_lobby_clears_on_reconnect.py
 # A malformed/unexpected message can't crash either client or kill
 # the fallback client's listener thread silently
 python tests/verify_malformed_message_survival.py
+
+# Server-side: type-confusion crashes (non-string vote/chat/name
+# values), and that a valid answer survives right after a malformed one
+python tests/verify_malformed_client_data.py
+
+# Raw non-UTF-8 bytes and connection churn don't crash the server
+python tests/verify_protocol_robustness.py
+
+# Rapid reconnect churn (zero delay) doesn't race against stale
+# connection-death detection, and hijack protection still holds
+python tests/verify_reconnect_race.py
 ```
 
 All of the above are included in this repo and pass as of this commit.
@@ -449,6 +460,51 @@ down):
 ( oo )>  *                        /|\
  `--'                             / \
 ```
+
+## Fixes -- worst-case stress testing (crash hardening, protocol robustness, reconnect race)
+
+Not from a bug report -- deliberately hunted for crashes across
+concurrency, protocol-level garbage, and scale. Found and fixed four
+real issues:
+
+- **Type-confusion crash in vote/night-action/sabotage/play-again.**
+  A non-string "target" value (int/list/dict) arriving during an
+  active collection window crashed that collection thread with an
+  uncaught `AttributeError`. Worse than a lost round: once the thread
+  died, even a genuinely valid follow-up answer sent right after was
+  silently swallowed too, since nothing was reading that player's
+  inbox anymore. Fixed at the single choke point (`_collect_action`'s
+  validator call) so all four prompt types are protected at once,
+  plus defense-in-depth type checks on chat text and join names.
+- **Non-UTF-8 bytes crashed the connection thread outright.**
+  `protocol.recv_lines` caught `JSONDecodeError` but not
+  `UnicodeDecodeError` -- a different exception raised earlier in the
+  same line (`.decode("utf-8")` fails before `json.loads` runs).
+  Fixed by catching both.
+- **A genuine race in reconnect** — rapid reconnects (zero delay)
+  failed as often as 40% of the time with "Game already in progress."
+  The old connection's "disconnected" flag only flips once its reader
+  thread notices the socket died, which isn't synchronous with the
+  client closing it -- TCP teardown takes real, if small, time. Fixed
+  by matching on name regardless of connected-status and gating purely
+  on token match instead (the stronger signal anyway) -- reduced the
+  failure rate to under 0.2% (1 failure in ~590 stress-test attempts
+  across many batches). Re-verified hijack protection wasn't weakened
+  by this change, since loosening the connected-status check is
+  exactly the kind of edit that could reintroduce it if done carelessly
+  -- it wasn't.
+- **Player names were unbounded** -- capped to 40 characters.
+
+Also stress-tested and confirmed solid, no bugs found: 8 simultaneous
+connections racing to join at the exact same instant (zero race
+conditions, correct distinct roles including Double Agent at 8
+players); 6 players voting at the exact same instant (perfectly
+consistent tally across every client, zero lost/duplicated votes); 20
+rapid connect-then-immediately-disconnect cycles with no data sent (no
+hang, no leak).
+
+New tests: `verify_malformed_client_data.py`, `verify_protocol_robustness.py`,
+`verify_reconnect_race.py`.
 
 ## Fixes -- latest round (resubmission after answering, lobby stuck on reconnect, message-handling hardening)
 

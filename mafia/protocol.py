@@ -33,7 +33,15 @@ def recv_lines(conn):
                 continue
             try:
                 yield json.loads(line.decode("utf-8"))
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 # Malformed line from a misbehaving client -- ignore
-                # rather than crashing the connection.
+                # rather than crashing the connection. Both exception
+                # types matter here: JSONDecodeError for syntactically
+                # invalid JSON, UnicodeDecodeError for raw bytes that
+                # aren't valid UTF-8 at all (decode() raises before
+                # json.loads() even runs, so this needs its own catch,
+                # not just the JSON one) -- found by deliberately
+                # sending non-UTF-8 bytes during stress testing; it
+                # crashed the connection's handling thread outright
+                # before this was added.
                 continue
