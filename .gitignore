@@ -8,3 +8,7 @@ __pycache__/
 .venv/
 venv/
 .mafia_rejoin_*.token
+# PyInstaller build artifacts -- rebuild locally with build_executable.py
+# rather than committing platform-specific binaries to the repo.
+build/
+dist/

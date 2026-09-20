@@ -310,6 +310,50 @@ plumbing works end-to-end, not just the logic in isolation.
 
 ---
 
+## Executable file
+
+For the "Executable File" deliverable: `launcher.py` is a single entry
+point that wraps both `run_server.py` and `run_client.py` behind a
+mode argument, with zero duplicated logic (it just dispatches straight
+into their existing `main()` functions), and PyInstaller bundles it
+into one standalone binary:
+
+```bash
+pip install pyinstaller
+python build_executable.py
+# -> dist/terminal-mafia (Linux/Mac) or dist/terminal-mafia.exe (Windows)
+```
+
+That one file needs no Python installation on the machine it's copied
+to, and covers both roles:
+
+```bash
+./terminal-mafia                          # interactive menu (no args needed)
+./terminal-mafia server --bots 3           # host a game directly
+./terminal-mafia client --name Alice --host <server-ip>
+```
+
+**PyInstaller doesn't cross-compile** -- build on whichever platform
+you need the executable for (a Linux build only runs on Linux, etc.).
+This was built and verified end-to-end on Linux as part of this
+project: a full bots-only match was run to completion through the
+built server executable (`GAME OVER` reached correctly), and the built
+client executable was connected through a real pseudo-terminal and
+confirmed to render the lobby banner, colors, and role assignment
+exactly like running from source, with no crash. One real bug was
+found and fixed in the process: the frozen executable's stdout wasn't
+flushing when not connected to a real terminal (redirected to a file
+or pipe), so a game could be running correctly underneath while
+producing zero visible output for many seconds — fixed by explicitly
+forcing line-buffered stdout/stderr at the top of `launcher.py`
+(`sys.stdout.reconfigure(line_buffering=True)`), which running from
+source via `python run_server.py` doesn't need since Python's own
+default stdio buffering differs there.
+
+If you need a Windows `.exe` for submission and don't have a Windows
+machine handy, run `build_executable.py` on any Windows machine (a
+teammate's laptop, a VM) — it's the same one command either way.
+
 ## Round timers -- customizable at lobby creation
 
 Discussion/vote/night-action timers no longer have to be edited in
