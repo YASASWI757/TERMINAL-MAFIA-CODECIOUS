@@ -243,6 +243,12 @@ python tests/verify_graveyard_and_double_agent.py
 # second match (new role_assigned, reshuffled roles, previously-dead
 # bots correctly resurrected), not stuck or disconnected
 python tests/verify_play_again.py
+
+# Ghost chat isolation: a ghost's message reaches other ghosts and is
+# NEVER received by a living player (real multi-second wait window,
+# not an instant check), and a living player's attempt to use the
+# channel reaches no one
+python tests/verify_ghost_chat.py
 ```
 
 All of the above are included in this repo and pass as of this commit.
@@ -347,6 +353,56 @@ A compact, running "Graveyard: Alice(VILLAGER), Bob(DETECTIVE)" line
 is shown after every elimination and on reconnect, so you don't have
 to scroll back through the log to remember who's already out and what
 they were.
+
+## Ghost chat
+
+Eliminated players can chat with each other at any time after death
+(not restricted to the discussion window the way the living's chat
+is) -- their own dedicated channel, invisible to anyone still alive.
+
+This was built with "0% risk to the living's chat" as the explicit
+requirement, so it's deliberately isolated end-to-end rather than
+reusing the existing chat with a flag on it:
+- **Its own message type** (`"ghost_chat"`, never the string `"chat"`)
+  all the way through -- server routing, the wire protocol, and each
+  client's rendering. A living player's client has no code path that
+  even knows how to display this type, so there's nothing for a bug
+  elsewhere to accidentally trigger.
+- **The recipient list is computed from scratch** (dead + human,
+  excluding the sender) rather than filtering the living's broadcast
+  list -- a separate, narrower list built by construction, not a
+  filter that could regress if the living chat's logic ever changes.
+- A living player attempting to use the channel (a rogue or buggy
+  client) is silently ignored -- checked first, before anything else.
+
+Verified with a dedicated isolation test (`verify_ghost_chat.py`) that
+proves, over real socket connections with a real multi-second wait
+window (not an instant check), that a ghost's message reaches other
+ghosts and is never received by a living player, and that a living
+player's attempt to use the channel reaches no one. Run 8+ times
+clean. Regular chat's own correctness (double-echo fix, dead-players-
+can't-speak-in-it) is untouched -- still fully covered by
+`verify_no_echo.py`.
+
+One real bug caught while building this test, worth calling out since
+it's a good illustration of a general risk with this kind of
+white-box testing: the first version of the isolation test mutated a
+player's `.alive` field directly while the server's own game-loop
+thread was still concurrently running (mid-night-phase), with no
+synchronization between the two. That's a genuine race -- roughly
+1-in-3 runs, the server's own legitimate game logic (a bot's night
+kill, or a fair vote) landed on the same player at an unlucky moment
+relative to the test's mutation, occasionally producing what looked
+like a leak but was actually a real, correct elimination happening
+through normal gameplay. Root-caused with a change-watcher thread
+that caught the exact moment and correlated it with the server's own
+console log, confirming it was a legitimate vote/kill, not a channel
+leak. Fixed by moving the mutation to only ever happen after a real
+`game_over` is confirmed (the server is then guaranteed to be parked
+inside `_offer_play_again`, which doesn't touch `.alive` until its own
+timeout elapses) -- a genuinely quiet window instead of a race. Ran
+8 consecutive times clean after the fix, versus roughly 1-in-3 failing
+before it.
 
 ## Death animation
 
@@ -559,6 +615,8 @@ Found and fixed during hands-on playtesting:
       changes, the graveyard, the final summary), are explicitly told
       their status the moment they die and whenever they try to act,
       and are blocked from voting/chatting but never from watching.
+      They also get their own dedicated ghost chat (see "Ghost chat"
+      above), isolated end-to-end from the living's channel.
 - [ ] Match history / replay -- half done. The *elimination* side is
       real: `elimination_log` tracks every death with round/phase/role,
       shown live as the "Graveyard" line and again as the match

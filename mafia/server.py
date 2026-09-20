@@ -231,6 +231,8 @@ class GameServer:
         msg_type = msg.get("type")
         if msg_type == "chat":
             self._handle_chat(player, msg.get("text", ""))
+        elif msg_type == "ghost_chat":
+            self._handle_ghost_chat(player, msg.get("text", ""))
         else:
             # vote / night_action / sabotage_decision replies go to
             # whichever _collect_action call is currently waiting on
@@ -256,6 +258,37 @@ class GameServer:
         self._broadcast_chat(player.name, text, players=others)
         self.game_state.discussion_log.append((player.name, text))
         bot_logic.update_accusation_count(self.game_state, text)
+
+    def _handle_ghost_chat(self, player, text):
+        """
+        A separate channel for eliminated players, deliberately kept
+        fully isolated from the living's chat rather than reusing it
+        with a flag:
+            - Its own message type end-to-end ("ghost_chat", never the
+              string "chat") -- a living player's client has no
+              rendering path for this type at all, so there's nothing
+              for a bug elsewhere to accidentally trigger.
+            - The recipient list is built by construction to exclude
+              every living player and every bot (dead + human only) --
+              this isn't a filter applied to the living's broadcast,
+              it's a separate, narrower list computed from scratch, so
+              there's no shared code path where a mistake in the
+              living chat's logic could leak into this one, or vice
+              versa.
+        Available any time after death (not restricted to the
+        DISCUSSION phase the way the living's chat is) -- ghosts
+        aren't bound by the living's turn structure.
+        """
+        if player.alive:
+            return  # a living player has no business here; ignore silently
+        if not text.strip() or self.game_state is None:
+            return
+        text = text.strip()[:300]
+        gs = self.game_state
+        other_dead_humans = [p for p in gs.players
+                              if not p.is_bot and not p.alive and p.id != player.id]
+        self._broadcast({"type": "ghost_chat", "sender": player.name, "text": text},
+                         players=other_dead_humans)
 
     # ------------------------------------------------------------------
     # Messaging helpers

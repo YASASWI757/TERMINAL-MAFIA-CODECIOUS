@@ -168,6 +168,7 @@ class ClientUI:
         self.countdown_label = ""
         self.running = True
         self.game_ended = False  # True once game_over has been received
+        self.is_ghost = False    # True once this player has been eliminated
 
         # Lobby screen state -- shown until the game actually starts
         # (the first role_assigned message flips this off).
@@ -260,6 +261,9 @@ class ClientUI:
                 protocol.send_json(self.sock, {"type": "play_again", "target": line})
                 self._log(f"> Submitted: {line}")
                 self._clear_countdown()
+            elif self.prompt_type == "ghost_chat":
+                protocol.send_json(self.sock, {"type": "ghost_chat", "text": line})
+                self._log(f"[Ghost] You: {line}")
             else:
                 self._log("[INFO] Nothing is expecting input right now.")
         except OSError:
@@ -436,6 +440,7 @@ class ClientUI:
         elif t == "role_assigned":
             self.in_lobby = False
             self.game_ended = False  # a fresh match is starting (first one, or a replay)
+            self.is_ghost = False    # everyone starts alive in a fresh match
             self._log("=" * 50)
             self._log(f"YOUR ROLE: {msg['role']}")
             self._log(msg["description"])
@@ -461,6 +466,18 @@ class ClientUI:
                 self._log("Voting is open -- wait for your prompt below.")
                 self._clear_countdown()
 
+            # Ghosts are never asked to vote or act, and aren't bound by
+            # the living's turn structure -- whatever the phase above
+            # just set prompt_type to, a ghost's input always goes to
+            # the separate ghost-chat channel instead. This runs after
+            # the phase-specific logic above (not woven into it) so it
+            # can never change what a LIVING player's prompt_type ends
+            # up as -- for anyone with is_ghost still False, none of
+            # this block does anything at all.
+            if self.is_ghost:
+                self.prompt_type = "ghost_chat"
+                self.prompt_hint = "Ghost chat (only other eliminated players see this)"
+
         elif t == "death_announcement":
             if msg["player"]:
                 self._play_death_animation()
@@ -470,13 +487,18 @@ class ClientUI:
             self._log_graveyard(msg.get("graveyard"))
 
         elif t == "eliminated":
+            self.is_ghost = True
             self._log(msg["text"])
-            self.prompt_type = None
-            self.prompt_hint = "(nothing expected -- spectating)"
+            self._log("You can now chat with other eliminated players -- the living can't see it.")
+            self.prompt_type = "ghost_chat"
+            self.prompt_hint = "Ghost chat (only other eliminated players see this)"
             self._clear_countdown()
 
         elif t == "chat":
             self._log(f"[{msg['sender']}]: {msg['text']}")
+
+        elif t == "ghost_chat":
+            self._log(f"[Ghost] {msg['sender']}: {msg['text']}")
 
         elif t == "private_result":
             self._log(f"[PRIVATE RESULT] {msg['text']}")
@@ -514,6 +536,10 @@ class ClientUI:
             self._log(f"[Reconnected] Round {msg['round']}, Phase {msg['phase']}, "
                       f"Role: {msg['role']}, You are: {'ALIVE' if msg['you_alive'] else 'dead'}")
             self._log_graveyard(msg.get("graveyard"))
+            if not msg["you_alive"]:
+                self.is_ghost = True
+                self.prompt_type = "ghost_chat"
+                self.prompt_hint = "Ghost chat (only other eliminated players see this)"
 
         elif t == "game_over":
             self._clear_countdown()
@@ -634,7 +660,7 @@ def _run_curses_client(sock, name):
 # ======================================================================
 
 def _run_simple_client(sock, name):
-    state = {"prompt_type": None, "name": name, "game_ended": False}
+    state = {"prompt_type": None, "name": name, "game_ended": False, "is_ghost": False}
 
     def _listen():
         try:
@@ -690,6 +716,7 @@ def _handle_message_simple(msg, state):
         print(f"[ERROR] {msg['text']}")
     elif t == "role_assigned":
         state["game_ended"] = False  # a fresh match is starting (first one, or a replay)
+        state["is_ghost"] = False    # everyone starts alive in a fresh match
         print("\n" + "=" * 50)
         print(f"YOUR ROLE: {msg['role']}")
         print(msg["description"])
@@ -707,6 +734,12 @@ def _handle_message_simple(msg, state):
             state["prompt_type"] = None
         elif msg["name"] == "VOTING":
             print("Voting is open -- wait for your prompt below.")
+        # Same override as the curses client: ghosts always land on the
+        # separate ghost-chat channel regardless of what phase-specific
+        # prompt_type was just set above -- this line does nothing at
+        # all for anyone with is_ghost still False.
+        if state.get("is_ghost"):
+            state["prompt_type"] = "ghost_chat"
     elif t == "death_announcement":
         if msg["player"]:
             print(f"\n{msg['player']} was found dead this morning. They were... {msg['role']}!")
@@ -714,10 +747,14 @@ def _handle_message_simple(msg, state):
             print("\nNo one died last night.")
         _print_graveyard_simple(msg.get("graveyard"))
     elif t == "eliminated":
+        state["is_ghost"] = True
         print(f"\n{msg['text']}\n")
-        state["prompt_type"] = None
+        print("You can now chat with other eliminated players -- the living can't see it.")
+        state["prompt_type"] = "ghost_chat"
     elif t == "chat":
         print(f"[{msg['sender']}]: {msg['text']}")
+    elif t == "ghost_chat":
+        print(f"[Ghost] {msg['sender']}: {msg['text']}")
     elif t == "private_result":
         print(f"\n[PRIVATE RESULT] {msg['text']}\n")
     elif t == "info":
@@ -745,6 +782,9 @@ def _handle_message_simple(msg, state):
         print(f"\n[Reconnected] Round {msg['round']}, Phase {msg['phase']}, "
               f"Role: {msg['role']}, You are: {'ALIVE' if msg['you_alive'] else 'dead'}")
         _print_graveyard_simple(msg.get("graveyard"))
+        if not msg["you_alive"]:
+            state["is_ghost"] = True
+            state["prompt_type"] = "ghost_chat"
     elif t == "game_over":
         state["game_ended"] = True
         print("\n" + "#" * 50)
@@ -785,6 +825,9 @@ def _send_current_simple(sock, state, line):
             protocol.send_json(sock, {"type": "sabotage_decision", "target": line})
         elif prompt_type == "play_again":
             protocol.send_json(sock, {"type": "play_again", "target": line})
+        elif prompt_type == "ghost_chat":
+            protocol.send_json(sock, {"type": "ghost_chat", "text": line})
+            print(f"[Ghost] You: {line}")
         else:
             print("[INFO] Nothing is expecting input right now.")
     except OSError:
