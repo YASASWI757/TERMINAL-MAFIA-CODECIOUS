@@ -169,6 +169,13 @@ class ClientUI:
         self.running = True
         self.game_ended = False  # True once game_over has been received
         self.is_ghost = False    # True once this player has been eliminated
+        # Remembers the prompt_type/hint just cleared after a one-shot
+        # submission (vote/night_action/sabotage_decision/play_again),
+        # so it can be restored if the server rejects that submission
+        # as invalid -- otherwise the player would have no way to
+        # retype a corrected answer within the same window.
+        self._pending_prompt_type = None
+        self._pending_prompt_hint = None
 
         # Lobby screen state -- shown until the game actually starts
         # (the first role_assigned message flips this off).
@@ -249,18 +256,30 @@ class ClientUI:
                 protocol.send_json(self.sock, {"type": "vote", "target": line})
                 self._log(f"> Voted: {line}")
                 self._clear_countdown()
+                self._pending_prompt_type, self._pending_prompt_hint = self.prompt_type, self.prompt_hint
+                self.prompt_type = None
+                self.prompt_hint = "(vote submitted -- waiting)"
             elif self.prompt_type == "night_action":
                 protocol.send_json(self.sock, {"type": "night_action", "target": line})
                 self._log(f"> Submitted: {line}")
                 self._clear_countdown()
+                self._pending_prompt_type, self._pending_prompt_hint = self.prompt_type, self.prompt_hint
+                self.prompt_type = None
+                self.prompt_hint = "(submitted -- waiting)"
             elif self.prompt_type == "sabotage_decision":
                 protocol.send_json(self.sock, {"type": "sabotage_decision", "target": line})
                 self._log(f"> Submitted: {line}")
                 self._clear_countdown()
+                self._pending_prompt_type, self._pending_prompt_hint = self.prompt_type, self.prompt_hint
+                self.prompt_type = None
+                self.prompt_hint = "(submitted -- waiting)"
             elif self.prompt_type == "play_again":
                 protocol.send_json(self.sock, {"type": "play_again", "target": line})
                 self._log(f"> Submitted: {line}")
                 self._clear_countdown()
+                self._pending_prompt_type, self._pending_prompt_hint = self.prompt_type, self.prompt_hint
+                self.prompt_type = None
+                self.prompt_hint = "(submitted -- waiting)"
             elif self.prompt_type == "ghost_chat":
                 protocol.send_json(self.sock, {"type": "ghost_chat", "text": line})
                 self._log(f"[Ghost] You: {line}")
@@ -406,7 +425,19 @@ class ClientUI:
                 msg = self.incoming.get_nowait()
             except queue.Empty:
                 return
-            self._handle_message(msg)
+            # A single malformed or unexpected message must never be
+            # able to crash the whole client -- without this, any
+            # KeyError/etc. in one handler would propagate all the way
+            # up through curses.wrapper and kill the process outright,
+            # which looks indistinguishable from "randomly
+            # disconnected" from the outside. Log and keep going
+            # instead. KeyboardInterrupt/SystemExit aren't Exception
+            # subclasses, so they still propagate normally.
+            try:
+                self._handle_message(msg)
+            except Exception as e:
+                self._log(f"[INFO] (internal: couldn't process a "
+                          f"'{msg.get('type', '?')}' message: {e})")
 
     def _handle_message(self, msg):
         t = msg.get("type")
@@ -449,6 +480,8 @@ class ClientUI:
             self._log("=" * 50)
 
         elif t == "phase":
+            self._pending_prompt_type = None
+            self._pending_prompt_hint = None
             self._log("")
             self._log(f"--- {msg['name']} (Round {msg['round']}) ---")
             if msg["name"] == "DISCUSSION":
@@ -505,8 +538,23 @@ class ClientUI:
 
         elif t == "info":
             self._log(f"[INFO] {msg['text']}")
+            # The server rejected the last submission as invalid and is
+            # still waiting on this same prompt -- restore it so the
+            # player can actually retype a corrected answer, instead of
+            # being stuck with "nothing is expecting input" for the
+            # rest of the window.
+            if "Invalid input" in msg["text"] and self._pending_prompt_type:
+                self.prompt_type = self._pending_prompt_type
+                self.prompt_hint = self._pending_prompt_hint
+                self._pending_prompt_type = None
+                self._pending_prompt_hint = None
 
         elif t == "prompt":
+            # A genuinely new prompt has arrived -- any pending
+            # restore-on-rejection state from an earlier, already-
+            # accepted submission is no longer relevant.
+            self._pending_prompt_type = None
+            self._pending_prompt_hint = None
             self.prompt_type = msg["prompt_type"]
             options = msg.get("options", [])
             timeout = msg.get("timeout", 0)
@@ -533,6 +581,15 @@ class ClientUI:
             self._log_graveyard(msg.get("graveyard"))
 
         elif t == "state_snapshot":
+            # The server only ever sends this when the game has already
+            # started (role is not None) -- so receiving it always
+            # means we're not in the lobby anymore. Without this, a
+            # player reconnecting mid-match stayed stuck on the lobby
+            # screen forever: nothing else sets in_lobby back to False
+            # on reconnect, since role_assigned (the only other place
+            # that clears it) is sent once per match, at the start, not
+            # re-sent on every reconnect.
+            self.in_lobby = False
             self._log(f"[Reconnected] Round {msg['round']}, Phase {msg['phase']}, "
                       f"Role: {msg['role']}, You are: {'ALIVE' if msg['you_alive'] else 'dead'}")
             self._log_graveyard(msg.get("graveyard"))
@@ -579,6 +636,8 @@ class ClientUI:
             # shortly after and the existing exit flow takes over from
             # there -- no separate handling needed for that case.
             timeout = msg.get("timeout", 20)
+            self._pending_prompt_type = None
+            self._pending_prompt_hint = None
             self.prompt_type = "play_again"
             self.prompt_hint = "Play again? (yes/no)"
             self._log("")
@@ -660,12 +719,22 @@ def _run_curses_client(sock, name):
 # ======================================================================
 
 def _run_simple_client(sock, name):
-    state = {"prompt_type": None, "name": name, "game_ended": False, "is_ghost": False}
+    state = {"prompt_type": None, "name": name, "game_ended": False, "is_ghost": False,
+              "pending_prompt_type": None}
 
     def _listen():
         try:
             for msg in protocol.recv_lines(sock):
-                _handle_message_simple(msg, state)
+                # Same reasoning as the curses client: one malformed
+                # message must never be able to silently kill this
+                # background thread (which would leave the client
+                # "deaf" to everything from then on, with no crash and
+                # no obvious symptom) or crash the process outright.
+                try:
+                    _handle_message_simple(msg, state)
+                except Exception as e:
+                    print(f"[INFO] (internal: couldn't process a "
+                          f"'{msg.get('type', '?')}' message: {e})")
         except (ConnectionError, OSError):
             pass
         if state["game_ended"]:
@@ -724,6 +793,7 @@ def _handle_message_simple(msg, state):
             print(f"Fellow Mafia-aligned teammate(s): {', '.join(msg['teammates'])}")
         print("=" * 50 + "\n")
     elif t == "phase":
+        state["pending_prompt_type"] = None
         print(f"\n--- {msg['name']} (Round {msg['round']}) ---")
         if msg["name"] == "DISCUSSION":
             print(f"Alive: {', '.join(msg['alive_players'])}")
@@ -759,7 +829,14 @@ def _handle_message_simple(msg, state):
         print(f"\n[PRIVATE RESULT] {msg['text']}\n")
     elif t == "info":
         print(f"[INFO] {msg['text']}")
+        # Server rejected the last submission and is still waiting on
+        # the same prompt -- restore it so the player can retype a
+        # corrected answer instead of being stuck with no active prompt.
+        if "Invalid input" in msg["text"] and state.get("pending_prompt_type"):
+            state["prompt_type"] = state["pending_prompt_type"]
+            state["pending_prompt_type"] = None
     elif t == "prompt":
+        state["pending_prompt_type"] = None
         state["prompt_type"] = msg["prompt_type"]
         options = msg.get("options", [])
         print(f"\n({msg.get('timeout')}s) Options: {', '.join(options)}")
@@ -807,6 +884,7 @@ def _handle_message_simple(msg, state):
 
     elif t == "play_again_prompt":
         timeout = msg.get("timeout", 20)
+        state["pending_prompt_type"] = None
         state["prompt_type"] = "play_again"
         print(f"\n({timeout}s) Play again? (yes/no)")
 
@@ -819,12 +897,24 @@ def _send_current_simple(sock, state, line):
             print(f"[You]: {line}")  # server no longer echoes to sender
         elif prompt_type == "vote":
             protocol.send_json(sock, {"type": "vote", "target": line})
+            print("> Vote submitted -- waiting.")
+            state["pending_prompt_type"] = prompt_type
+            state["prompt_type"] = None
         elif prompt_type == "night_action":
             protocol.send_json(sock, {"type": "night_action", "target": line})
+            print("> Submitted -- waiting.")
+            state["pending_prompt_type"] = prompt_type
+            state["prompt_type"] = None
         elif prompt_type == "sabotage_decision":
             protocol.send_json(sock, {"type": "sabotage_decision", "target": line})
+            print("> Submitted -- waiting.")
+            state["pending_prompt_type"] = prompt_type
+            state["prompt_type"] = None
         elif prompt_type == "play_again":
             protocol.send_json(sock, {"type": "play_again", "target": line})
+            print("> Submitted -- waiting.")
+            state["pending_prompt_type"] = prompt_type
+            state["prompt_type"] = None
         elif prompt_type == "ghost_chat":
             protocol.send_json(sock, {"type": "ghost_chat", "text": line})
             print(f"[Ghost] You: {line}")

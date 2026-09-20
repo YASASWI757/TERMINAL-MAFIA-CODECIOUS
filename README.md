@@ -249,6 +249,20 @@ python tests/verify_play_again.py
 # not an instant check), and a living player's attempt to use the
 # channel reaches no one
 python tests/verify_ghost_chat.py
+
+# Can't resubmit a vote/night-action/sabotage-decision/play-again
+# answer after it's already been taken, and an actually-invalid
+# submission still lets you retry afterward (doesn't leave you stuck)
+python tests/verify_no_resubmit.py
+
+# The lobby screen doesn't stay stuck after reconnecting mid-match --
+# renders the actual reconnected screen via a terminal emulator
+# library and confirms it shows real game state, not a frozen lobby
+python tests/verify_lobby_clears_on_reconnect.py
+
+# A malformed/unexpected message can't crash either client or kill
+# the fallback client's listener thread silently
+python tests/verify_malformed_message_survival.py
 ```
 
 All of the above are included in this repo and pass as of this commit.
@@ -436,7 +450,67 @@ down):
  `--'                             / \
 ```
 
-## Fixes -- latest round (reconnect security, graveyard, double agent, bot variety)
+## Fixes -- latest round (resubmission after answering, lobby stuck on reconnect, message-handling hardening)
+
+Three issues reported from real playtesting, all confirmed and fixed:
+
+- **Voting / night-action prompts could be resubmitted after the first
+  answer was already taken.** Root cause: `vote`, `night_action`,
+  `sabotage_decision`, and `play_again` all sent their answer and
+  cleared the countdown, but never reset `prompt_type` afterward --
+  so the client stayed "listening" and would happily send a second,
+  redundant submission if the player kept typing. Fixed in both
+  clients: `prompt_type` now clears the moment a submission goes out.
+  The companion risk this creates -- what if the server rejects that
+  submission as genuinely invalid? -- is also handled: the client
+  remembers what it just cleared, and restores the prompt if an
+  "Invalid input" message comes back, so a typo doesn't leave the
+  player stuck unable to retry. Verified directly against a real
+  running client: a valid first answer is accepted and a second
+  attempt is rejected client-side with "Nothing is expecting input";
+  an actually-invalid answer is rejected *and* the retry right after
+  goes through cleanly (`verify_no_resubmit.py`).
+
+- **The lobby screen stayed stuck after reconnecting mid-match**,
+  showing "Players connected: 0 / 0" and "Waiting for the host to
+  start the match..." forever even though the real game had already
+  started and was progressing normally underneath (visible in the
+  reported screenshot: `[SERVER] === NIGHT 1 ===` right below the
+  frozen lobby screen). Root cause: `role_assigned` -- the only
+  message that ever cleared the lobby-screen flag -- is sent once per
+  match, at the start, and is never re-sent on reconnect. The server
+  *does* send `state_snapshot` on every reconnect once the game has
+  started, but nothing was listening to it for this purpose. Fixed by
+  clearing the flag there too, since the server only ever sends a
+  `state_snapshot` when a role has already been assigned. Verified by
+  rendering the actual reconnected client's screen with a terminal
+  emulator library (not just checking it didn't crash) and confirming
+  it shows real game state instead of the lobby (`verify_lobby_clears_on_reconnect.py`).
+
+- **"Random disconnects"** turned out to most likely not be random at
+  all: the lobby-stuck bug above makes a completely normal, working
+  reconnect *look* broken (frozen screen, game clearly still running
+  underneath), which reads as "randomly disconnecting" even when the
+  reconnect itself succeeded -- consistent with what was reported
+  ("all the inputs are taken... voting everything is working"). While
+  investigating, a real gap was found and closed regardless: neither
+  client had any guard around message processing, so a single
+  malformed or unexpected message could have crashed the curses
+  client outright, or silently killed the fallback client's listener
+  thread (leaving it "deaf" with no crash and no obvious symptom --
+  arguably worse, since nothing would ever look wrong until someone
+  noticed the game had stopped updating). Both are now wrapped so one
+  bad message gets logged and skipped rather than taking down the
+  whole client. Verified with a minimal fake server that deliberately
+  sends a malformed message (missing fields the old code accessed
+  directly) followed by a well-formed one, confirming both clients
+  survive and keep processing normally afterward
+  (`verify_malformed_message_survival.py`). Genuine network flakiness
+  (shared hotspot, multiple laptops) remains possible and isn't
+  something code can fix -- but should now be much easier to tell
+  apart from a display bug if it happens again.
+
+## Fixes -- reconnect security, graveyard, double agent, bot variety
 
 - **Reconnect hijack.** See "Reconnect security" above.
 - **Reconnect didn't restore the active prompt.** See "Reconnect
