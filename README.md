@@ -552,15 +552,26 @@ Found and fixed during hands-on playtesting:
 - [x] AI bot players to fill a lobby (stretch goal)
 - [x] Additional special roles beyond the basic two sides: Detective,
       Doctor, Saboteur, Double Agent (stretch goal)
-- [ ] Spectator mode for eliminated players (not implemented — see
-      "Possible next steps" below)
-- [ ] Match history / replay (discussion log is already tracked in
-      `game_state.discussion_log`, but no replay viewer yet)
+- [x] Spectator mode for eliminated players (stretch goal) -- came
+      together as a byproduct of several fixes rather than one
+      feature: eliminated players stay connected and keep receiving
+      every broadcast (chat, death announcements, vote results, phase
+      changes, the graveyard, the final summary), are explicitly told
+      their status the moment they die and whenever they try to act,
+      and are blocked from voting/chatting but never from watching.
+- [ ] Match history / replay -- half done. The *elimination* side is
+      real: `elimination_log` tracks every death with round/phase/role,
+      shown live as the "Graveyard" line and again as the match
+      summary at game over. The *chat transcript*
+      (`game_state.discussion_log`) is still purely internal, though --
+      it's only ever used server-side to weight bot suspicion, and is
+      never sent to any client, so there's no way to review what was
+      actually said in past rounds. A fuller replay viewer (chat
+      included) isn't built.
 
 ## Possible next steps if time remains
 
-- Spectator mode: eliminated players already stay connected (Option A
-  disconnect policy keeps them "in" the server) — they just need a
-  `phase`/`chat` broadcast subscription without action prompts.
-- Match replay: `discussion_log` and vote tallies are already recorded
-  per round; a replay viewer just needs to render what's already there.
+- Match replay: `discussion_log` already records every chat line in
+  order; a replay viewer just needs to send it to clients (e.g. in the
+  game_over payload, or on request) and render it -- the elimination
+  side of history already works this way (see above).
