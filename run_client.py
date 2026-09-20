@@ -136,6 +136,62 @@ TITLE_BANNER = [
 ]
 TAGLINE = "deception \u00b7 deduction \u00b7 survival"
 
+# Color pairs, initialized once curses starts (see _init_colors below).
+# Named constants instead of bare numbers so every draw call site
+# stays readable. Falls back gracefully to plain attributes (bold /
+# reverse / dim) on terminals that don't support color at all -- see
+# _color() below, which is what every draw call actually uses.
+COLOR_TITLE = 1        # banner + tagline -- cyan, bold
+COLOR_BORDER = 2       # lobby frame -- blue
+COLOR_HEADING = 3      # "LOBBY", phase headers -- yellow, bold
+COLOR_GOOD = 4         # villager-aligned, alive, success -- green
+COLOR_BAD = 5          # mafia-aligned, death, elimination -- red
+COLOR_INFO = 6         # system/info notices -- yellow
+COLOR_GHOST = 7         # ghost chat -- magenta
+COLOR_CHAT_NAME = 8    # chat sender names -- cyan
+COLOR_STATUS_BAR = 9   # countdown status bar -- black on cyan
+
+
+def _init_colors():
+    """
+    Sets up curses color pairs if the terminal supports color;
+    silently does nothing otherwise (every draw call falls back to
+    plain attributes via _color() below, so lack of color support
+    degrades gracefully rather than breaking anything).
+    """
+    if not curses.has_colors():
+        return
+    try:
+        curses.start_color()
+        curses.use_default_colors()  # -1 = "terminal's own background", keeps transparency
+        curses.init_pair(COLOR_TITLE, curses.COLOR_CYAN, -1)
+        curses.init_pair(COLOR_BORDER, curses.COLOR_BLUE, -1)
+        curses.init_pair(COLOR_HEADING, curses.COLOR_YELLOW, -1)
+        curses.init_pair(COLOR_GOOD, curses.COLOR_GREEN, -1)
+        curses.init_pair(COLOR_BAD, curses.COLOR_RED, -1)
+        curses.init_pair(COLOR_INFO, curses.COLOR_YELLOW, -1)
+        curses.init_pair(COLOR_GHOST, curses.COLOR_MAGENTA, -1)
+        curses.init_pair(COLOR_CHAT_NAME, curses.COLOR_CYAN, -1)
+        curses.init_pair(COLOR_STATUS_BAR, curses.COLOR_BLACK, curses.COLOR_CYAN)
+    except curses.error:
+        pass  # some terminals advertise color support but choke on init anyway
+
+
+def _color(pair_id, bold=False):
+    """
+    Returns the curses attribute for a named color pair, or a sane
+    plain-attribute fallback (bold/reverse/normal) if colors aren't
+    available at all -- every draw call goes through this rather than
+    calling curses.color_pair() directly, so nothing needs its own
+    has_colors() check.
+    """
+    if curses.has_colors():
+        attr = curses.color_pair(pair_id)
+        return attr | curses.A_BOLD if bold else attr
+    if pair_id == COLOR_STATUS_BAR:
+        return curses.A_REVERSE
+    return curses.A_BOLD if bold else curses.A_NORMAL
+
 
 # ======================================================================
 # Curses UI (primary experience -- Linux / Mac, or Windows with
@@ -192,6 +248,7 @@ class ClientUI:
             curses.curs_set(1)
         except curses.error:
             pass  # some terminals don't support cursor visibility changes
+        _init_colors()
         self.stdscr.timeout(100)  # getch() blocks up to 100ms, then returns -1
 
         threading.Thread(target=self._listen, daemon=True).start()
@@ -325,27 +382,27 @@ class ClientUI:
             if row < 0 or row >= h or w < 2:
                 return
             try:
-                self.stdscr.addstr(row, 0, "\u2551")
-                self.stdscr.addstr(row, w - 1, "\u2551")
+                self.stdscr.addstr(row, 0, "\u2551", _color(COLOR_BORDER))
+                self.stdscr.addstr(row, w - 1, "\u2551", _color(COLOR_BORDER))
             except curses.error:
                 pass
 
         row = 1
         for line in TITLE_BANNER:
-            put_centered(row, line, curses.A_BOLD)
+            put_centered(row, line, _color(COLOR_TITLE, bold=True))
             row += 1
         row += 1
-        put_centered(row, TAGLINE)
+        put_centered(row, TAGLINE, _color(COLOR_TITLE))
         row += 2
 
         sep = "\u2550" * max(0, w - 2)
         try:
-            self.stdscr.addnstr(row, 1, sep, max(0, w - 2))
+            self.stdscr.addnstr(row, 1, sep, max(0, w - 2), _color(COLOR_BORDER))
         except curses.error:
             pass
         row += 2
 
-        put_left(row, "LOBBY", attr=curses.A_BOLD)
+        put_left(row, "LOBBY", attr=_color(COLOR_HEADING, bold=True))
         row += 2
 
         if self.lobby_target_bots:
@@ -353,12 +410,13 @@ class ClientUI:
                       f"({self.lobby_target_bots} bot(s) will fill the rest)")
         else:
             status = f"Players connected: {self.lobby_connected} / {self.lobby_needed}"
-        put_left(row, status)
+        put_left(row, status, attr=_color(COLOR_INFO))
         row += 2
 
         for p in self.lobby_players:
             tag = " (bot)" if p["is_bot"] else ""
-            put_left(row, f"\u25cf {p['name']}{tag}")
+            name_color = _color(COLOR_CHAT_NAME) if not p["is_bot"] else _color(COLOR_BORDER)
+            put_left(row, f"\u25cf {p['name']}{tag}", attr=name_color)
             row += 1
             if row >= h - 3:
                 break
@@ -366,15 +424,16 @@ class ClientUI:
         for r in range(0, min(row + 2, h)):
             border_row(r)
 
-        put_left(min(h - 1, row + 1), "Waiting for the host to start the match...")
+        put_left(min(h - 1, row + 1), "Waiting for the host to start the match...",
+                 attr=_color(COLOR_INFO))
 
         self.stdscr.refresh()
 
     # ---- log ----
 
-    def _log(self, text):
+    def _log(self, text, attr=None):
         for line in str(text).split("\n"):
-            self.log_lines.append(line)
+            self.log_lines.append((line, attr))
         if len(self.log_lines) > 1000:  # cap memory for a very long match
             self.log_lines = self.log_lines[-1000:]
 
@@ -387,7 +446,7 @@ class ClientUI:
         if not graveyard:
             return
         parts = [f"{e['player']}({e['role']})" for e in graveyard]
-        self._log("Graveyard: " + ", ".join(parts))
+        self._log("Graveyard: " + ", ".join(parts), _color(COLOR_INFO))
 
     # ---- death animation ----
 
@@ -466,24 +525,28 @@ class ClientUI:
             self.lobby_players = msg["players"]
 
         elif t == "error":
-            self._log(f"[ERROR] {msg['text']}")
+            self._log(f"[ERROR] {msg['text']}", _color(COLOR_BAD, bold=True))
 
         elif t == "role_assigned":
             self.in_lobby = False
             self.game_ended = False  # a fresh match is starting (first one, or a replay)
             self.is_ghost = False    # everyone starts alive in a fresh match
-            self._log("=" * 50)
-            self._log(f"YOUR ROLE: {msg['role']}")
+            role_color = (_color(COLOR_BAD, bold=True)
+                          if msg["role"] in ("MAFIA", "DOUBLE_AGENT")
+                          else _color(COLOR_GOOD, bold=True))
+            self._log("=" * 50, role_color)
+            self._log(f"YOUR ROLE: {msg['role']}", role_color)
             self._log(msg["description"])
             if msg.get("teammates"):
-                self._log(f"Fellow Mafia-aligned teammate(s): {', '.join(msg['teammates'])}")
-            self._log("=" * 50)
+                self._log(f"Fellow Mafia-aligned teammate(s): {', '.join(msg['teammates'])}",
+                          _color(COLOR_BAD))
+            self._log("=" * 50, role_color)
 
         elif t == "phase":
             self._pending_prompt_type = None
             self._pending_prompt_hint = None
             self._log("")
-            self._log(f"--- {msg['name']} (Round {msg['round']}) ---")
+            self._log(f"--- {msg['name']} (Round {msg['round']}) ---", _color(COLOR_HEADING, bold=True))
             if msg["name"] == "DISCUSSION":
                 self._log(f"Alive: {', '.join(msg['alive_players'])}")
                 self._log(f"You have {msg['timeout']}s to discuss.")
@@ -514,30 +577,32 @@ class ClientUI:
         elif t == "death_announcement":
             if msg["player"]:
                 self._play_death_animation()
-                self._log(f"{msg['player']} was found dead this morning. They were... {msg['role']}!")
+                self._log(f"{msg['player']} was found dead this morning. They were... {msg['role']}!",
+                          _color(COLOR_BAD, bold=True))
             else:
-                self._log("No one died last night.")
+                self._log("No one died last night.", _color(COLOR_GOOD))
             self._log_graveyard(msg.get("graveyard"))
 
         elif t == "eliminated":
             self.is_ghost = True
-            self._log(msg["text"])
-            self._log("You can now chat with other eliminated players -- the living can't see it.")
+            self._log(msg["text"], _color(COLOR_BAD, bold=True))
+            self._log("You can now chat with other eliminated players -- the living can't see it.",
+                      _color(COLOR_GHOST))
             self.prompt_type = "ghost_chat"
             self.prompt_hint = "Ghost chat (only other eliminated players see this)"
             self._clear_countdown()
 
         elif t == "chat":
-            self._log(f"[{msg['sender']}]: {msg['text']}")
+            self._log(f"[{msg['sender']}]: {msg['text']}", _color(COLOR_CHAT_NAME))
 
         elif t == "ghost_chat":
-            self._log(f"[Ghost] {msg['sender']}: {msg['text']}")
+            self._log(f"[Ghost] {msg['sender']}: {msg['text']}", _color(COLOR_GHOST))
 
         elif t == "private_result":
-            self._log(f"[PRIVATE RESULT] {msg['text']}")
+            self._log(f"[PRIVATE RESULT] {msg['text']}", _color(COLOR_HEADING, bold=True))
 
         elif t == "info":
-            self._log(f"[INFO] {msg['text']}")
+            self._log(f"[INFO] {msg['text']}", _color(COLOR_INFO))
             # The server rejected the last submission as invalid and is
             # still waiting on this same prompt -- restore it so the
             # player can actually retype a corrected answer, instead of
@@ -571,13 +636,14 @@ class ClientUI:
                 self._set_countdown(timeout, "Vote")
 
         elif t == "vote_results":
-            self._log("--- VOTE RESULTS ---")
+            self._log("--- VOTE RESULTS ---", _color(COLOR_HEADING, bold=True))
             for name, count in msg["tally"].items():
                 self._log(f"  {name}: {count} vote(s)")
             if msg["eliminated"]:
-                self._log(f"{msg['eliminated']} has been eliminated. They were {msg['eliminated_role']}!")
+                self._log(f"{msg['eliminated']} has been eliminated. They were {msg['eliminated_role']}!",
+                          _color(COLOR_BAD, bold=True))
             else:
-                self._log("No majority reached -- no one was eliminated.")
+                self._log("No majority reached -- no one was eliminated.", _color(COLOR_GOOD))
             self._log_graveyard(msg.get("graveyard"))
 
         elif t == "state_snapshot":
@@ -591,7 +657,8 @@ class ClientUI:
             # re-sent on every reconnect.
             self.in_lobby = False
             self._log(f"[Reconnected] Round {msg['round']}, Phase {msg['phase']}, "
-                      f"Role: {msg['role']}, You are: {'ALIVE' if msg['you_alive'] else 'dead'}")
+                      f"Role: {msg['role']}, You are: {'ALIVE' if msg['you_alive'] else 'dead'}",
+                      _color(COLOR_HEADING, bold=True))
             self._log_graveyard(msg.get("graveyard"))
             if not msg["you_alive"]:
                 self.is_ghost = True
@@ -601,21 +668,24 @@ class ClientUI:
         elif t == "game_over":
             self._clear_countdown()
             self.game_ended = True
-            self._log("#" * 50)
+            winner_color = (_color(COLOR_GOOD, bold=True) if msg["winner"] == "VILLAGERS"
+                             else _color(COLOR_BAD, bold=True))
+            self._log("#" * 50, winner_color)
             self._log(f"GAME OVER -- {msg['winner']} WIN! "
-                      f"({msg.get('rounds_played', '?')} rounds played)")
+                      f"({msg.get('rounds_played', '?')} rounds played)", winner_color)
             entries = msg.get("elimination_log") or []
             if entries:
                 self._log("")
-                self._log("Match summary:")
+                self._log("Match summary:", _color(COLOR_HEADING, bold=True))
                 for e in entries:
                     self._log(f"  Round {e['round']} [{e['phase']}]: {e['player']} -- {e['role']}")
             self._log("")
-            self._log("Final roles:")
+            self._log("Final roles:", _color(COLOR_HEADING, bold=True))
             for r in msg["reveal"]:
                 status = "alive" if r["alive"] else "dead"
-                self._log(f"  {r['name']:20s} {r['role']:15s} ({status})")
-            self._log("#" * 50)
+                row_color = _color(COLOR_GOOD) if r["alive"] else _color(COLOR_BAD)
+                self._log(f"  {r['name']:20s} {r['role']:15s} ({status})", row_color)
+            self._log("#" * 50, winner_color)
             self._log("")
             self._log("Press Enter to close.")
             # Deliberately NOT setting self.running = False here -- the
@@ -658,16 +728,19 @@ class ClientUI:
 
         # Word-wrap at draw time (not at log time) so a terminal resize
         # is reflected immediately without needing to reformat history.
+        # Each (text, attr) entry can wrap into several screen lines;
+        # every wrapped sub-line carries the SAME attr as its source
+        # entry, so a colored line doesn't lose its color mid-wrap.
         wrapped = []
-        for entry in self.log_lines:
-            if entry == "":
-                wrapped.append("")
+        for text, attr in self.log_lines:
+            if text == "":
+                wrapped.append(("", attr))
             else:
-                wrapped.extend(textwrap.wrap(entry, wrap_width) or [""])
+                wrapped.extend((line, attr) for line in (textwrap.wrap(text, wrap_width) or [""]))
 
-        for i, line in enumerate(wrapped[-log_h:]):
+        for i, (line, attr) in enumerate(wrapped[-log_h:]):
             try:
-                self.stdscr.addnstr(i, 0, line, wrap_width)
+                self.stdscr.addnstr(i, 0, line, wrap_width, attr or curses.A_NORMAL)
             except curses.error:
                 pass
 
@@ -679,20 +752,20 @@ class ClientUI:
             status_text = " "
         try:
             self.stdscr.addnstr(status_row, 0, status_text.ljust(wrap_width),
-                                wrap_width, curses.A_REVERSE)
+                                wrap_width, _color(COLOR_STATUS_BAR, bold=True))
         except curses.error:
             pass
 
         sep_row = log_h + 1
         try:
-            self.stdscr.addnstr(sep_row, 0, "-" * wrap_width, wrap_width)
+            self.stdscr.addnstr(sep_row, 0, "-" * wrap_width, wrap_width, _color(COLOR_BORDER))
         except curses.error:
             pass
 
         input_row = log_h + 2
         display = f"{self.prompt_hint} > {self.input_buffer}"
         try:
-            self.stdscr.addnstr(input_row, 0, display, wrap_width)
+            self.stdscr.addnstr(input_row, 0, display, wrap_width, _color(COLOR_HEADING))
         except curses.error:
             pass
         cursor_col = min(wrap_width, len(self.prompt_hint) + 3 + len(self.input_buffer))

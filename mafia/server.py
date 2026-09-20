@@ -276,6 +276,21 @@ class GameServer:
         finally:
             player.connected = False
             print(f"[SERVER] {player.name} disconnected.")
+            if not self.started:
+                # Pre-game disconnect: remove permanently, don't hold
+                # a slot or assign them a role -- play with one fewer
+                # player instead of waiting for them to come back.
+                # Once the match has actually started, this branch
+                # never runs and the normal reconnect logic (unchanged)
+                # applies instead.
+                with self.lock:
+                    if player in self.players:
+                        self.players.remove(player)
+                        if self.min_players > 4:  # never go below the engine's hard floor
+                            self.min_players -= 1
+                print(f"[SERVER] {player.name} left before the game started -- "
+                      f"removed permanently, playing with one fewer player.")
+                self._broadcast_lobby_update()
 
     def _handle_incoming(self, player, msg):
         msg_type = msg.get("type")

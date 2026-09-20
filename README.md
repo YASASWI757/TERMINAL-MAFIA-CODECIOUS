@@ -56,6 +56,12 @@ mid-night-action, it re-sends you that exact prompt too. (Reconnect is
 protected by a small local token file the client saves on first join —
 see "Reconnect security" below for why, and why the folder matters.)
 
+This only applies **after** the match has started. If you disconnect
+while still in the lobby (before the host starts the match), you're
+removed permanently instead — no held slot, no role ever assigned to
+you — and the match proceeds with one fewer player. Rejoin with a new
+name if you want back in before it starts.
+
 ---
 
 ## Architecture
@@ -157,24 +163,36 @@ it, and it's enforced in `roles.py`, not just by convention.
 
 ## Disconnect / invalid input handling
 
-Every action — night action, vote, sabotage decision — goes through
-one function (`GameServer._collect_action`) that treats "disconnected,"
-"connected but silent," and "sent something invalid" uniformly:
+The rule differs by whether the match has started yet:
 
-- **Timeout with no valid input** → treated as no action / abstain,
-  the round moves on. The game is never blocked waiting on one player.
-- **Player stays in the game as alive-but-idle** — never auto-kicked
-  or auto-eliminated. This keeps win-condition math and role state
-  simple, and means a flaky wifi drop mid-round doesn't corrupt the
-  match.
-- **Reconnect** — a rejoin with the same name re-attaches the existing
-  Player object (role, alive status, everything) to the new socket and
-  sends a state snapshot to resync the client's display.
-- **Invalid input** (typo'd name, etc.) → the player is told and can
-  retry within whatever time remains; it never crashes the server.
-- **Being disconnected grants no immunity** — a disconnected player
-  can still be killed or voted out; otherwise "disconnect to survive"
-  would be a free exploit.
+- **Before the match starts:** a disconnect removes that player
+  permanently. No held slot, no role ever assigned to them, no
+  waiting for them to come back -- the match proceeds with one fewer
+  player instead. `min_players` decrements to match (floored at 4,
+  the engine's hard minimum for role assignment -- it will never ask
+  the host to wait for a replacement below that floor, but it also
+  won't let the total drop below what role assignment actually needs).
+- **Once the match has started:** every action — night action, vote,
+  sabotage decision — goes through one function
+  (`GameServer._collect_action`) that treats "disconnected,"
+  "connected but silent," and "sent something invalid" uniformly:
+  - **Timeout with no valid input** → treated as no action / abstain,
+    the round moves on. The game is never blocked waiting on one
+    player.
+  - **Player stays in the game as alive-but-idle** — never
+    auto-kicked or auto-eliminated for disconnecting mid-match. This
+    keeps win-condition math and role state simple, and means a
+    flaky wifi drop mid-round doesn't corrupt the match.
+  - **Reconnect** — a rejoin with the same name and token re-attaches
+    the existing Player object (role, alive status, everything) to
+    the new socket, sends a state snapshot to resync the client's
+    display, and re-sends whatever prompt was active if the window
+    hasn't closed yet.
+  - **Invalid input** (typo'd name, etc.) → the player is told and can
+    retry within whatever time remains; it never crashes the server.
+  - **Being disconnected grants no immunity** — a disconnected player
+    can still be killed or voted out; otherwise "disconnect to
+    survive" would be a free exploit.
 
 ---
 
@@ -274,6 +292,10 @@ python tests/verify_protocol_robustness.py
 # Rapid reconnect churn (zero delay) doesn't race against stale
 # connection-death detection, and hijack protection still holds
 python tests/verify_reconnect_race.py
+
+# Pre-game disconnects are removed permanently (min_players decrements,
+# floored at 4); post-game-start disconnects are completely unaffected
+python tests/verify_lobby_disconnect_removal.py
 ```
 
 All of the above are included in this repo and pass as of this commit.
@@ -352,6 +374,28 @@ previously had zero visibility into who else had joined pre-game; the
 server only ever printed that to its own console). Curses-only, same
 scope as the other visual touches; the plain-text fallback client
 keeps its existing simple "Connected as X. Waiting..." line.
+
+## Color
+
+The curses client is colorized throughout, not just the lobby: cyan
+for the title/banner and headers, green for villager-aligned/good
+outcomes, red for mafia-aligned/deaths/eliminations, yellow for
+system info and phase headers, magenta for ghost chat, cyan for chat
+sender names, and a black-on-cyan status bar for the live countdown.
+Role reveals are colored by alignment (green for villager-aligned
+roles, red for Mafia and Double Agent), and the final game-over banner
+and role table are colored by outcome (green if Villagers won, red if
+Mafia won; each row in the final reveal also shows alive in green,
+dead in red).
+
+Every draw call goes through one small helper (`_color()`) that checks
+`curses.has_colors()` once and falls back to plain bold/reverse/normal
+attributes on terminals that don't support color at all -- so a
+color-incapable terminal still renders correctly, just without color,
+rather than breaking. Verified by rendering actual output through a
+terminal emulator library and inspecting real per-cell color
+attributes (not just checking the text is present) -- both in the
+lobby and mid-game.
 
 ## Reconnect security
 
@@ -460,6 +504,25 @@ down):
 ( oo )>  *                        /|\
  `--'                             / \
 ```
+
+## Fixes -- lobby disconnect handling, colorized UI
+
+- **Pre-game disconnects now remove the player permanently** instead
+  of holding their slot. Before this, anyone who left the lobby before
+  the match started was treated the same as a mid-match disconnect
+  (kept, reconnectable) -- but there's no role or game state to
+  preserve for someone who never actually played, so the match now
+  proceeds with one fewer player instead of waiting. `min_players`
+  decrements to match, floored at 4 (the engine's hard minimum for
+  role assignment). Disconnects *after* the match starts are completely
+  unaffected -- same reconnect logic as always. Verified directly:
+  removal, the floor, and post-game-start non-removal all confirmed
+  (`verify_lobby_disconnect_removal.py`).
+- **Curses client colorized throughout** (lobby, role reveals, phase
+  headers, chat, deaths, game over) -- see "Color" above for the full
+  palette. Verified by rendering real output through a terminal
+  emulator library and inspecting actual per-cell color attributes,
+  not just checking the text.
 
 ## Fixes -- worst-case stress testing (crash hardening, protocol robustness, reconnect race)
 
@@ -712,8 +775,11 @@ Found and fixed during hands-on playtesting:
 
 - **Tie vote → no elimination**, not a random tiebreak. Simplicity
   over drama, on purpose.
-- **Disconnected players are alive-but-idle**, never auto-eliminated
-  (see Disconnect handling above).
+- **Disconnected players are alive-but-idle once the match has
+  started**, never auto-eliminated for it (see Disconnect handling
+  above) -- but a disconnect *before* the match starts removes them
+  permanently instead, since there's no role or game state to
+  preserve yet.
 - **Doctor has no cooldown** and can protect themselves every night —
   standard Mafia balance; without self-protect, a suspected Doctor is
   a guaranteed kill.
