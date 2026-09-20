@@ -1,0 +1,52 @@
+name: Build executables
+
+# Runs automatically on every push to main/master, and can also be
+# triggered manually from the Actions tab (the "Run workflow" button).
+# Builds on GitHub's own real Windows/Mac/Linux runners -- these are
+# genuine native builds, not cross-compiled or emulated, which is
+# exactly what PyInstaller requires (it bundles the actual platform
+# interpreter and C extensions, so it has to run ON that platform).
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Install windows-curses (Windows only)
+        if: runner.os == 'Windows'
+        run: pip install windows-curses
+
+      - name: Build the executable
+        run: python build_executable.py
+
+      - name: Rename output per-platform for clarity
+        shell: bash
+        run: |
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            mv terminal-mafia.exe terminal-mafia-windows.exe
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            mv terminal-mafia terminal-mafia-macos
+          else
+            mv terminal-mafia terminal-mafia-linux
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: terminal-mafia-${{ runner.os }}
+          path: dist/terminal-mafia-*

@@ -316,16 +316,8 @@ For the "Executable File" deliverable: `launcher.py` is a single entry
 point that wraps both `run_server.py` and `run_client.py` behind a
 mode argument, with zero duplicated logic (it just dispatches straight
 into their existing `main()` functions), and PyInstaller bundles it
-into one standalone binary:
-
-```bash
-pip install pyinstaller
-python build_executable.py
-# -> dist/terminal-mafia (Linux/Mac) or dist/terminal-mafia.exe (Windows)
-```
-
-That one file needs no Python installation on the machine it's copied
-to, and covers both roles:
+into one standalone binary. That one file needs no Python installation
+on the machine it's copied to, and covers both roles:
 
 ```bash
 ./terminal-mafia                          # interactive menu (no args needed)
@@ -333,8 +325,35 @@ to, and covers both roles:
 ./terminal-mafia client --name Alice --host <server-ip>
 ```
 
-**PyInstaller doesn't cross-compile** -- build on whichever platform
-you need the executable for (a Linux build only runs on Linux, etc.).
+**PyInstaller doesn't cross-compile** -- it bundles the real platform
+interpreter and C extensions, so it has to run *on* the platform
+you're building for. Two ways to get a build:
+
+**Automatic, for all three platforms, no extra machine needed:**
+`.github/workflows/build-executables.yml` builds Windows, Mac, and
+Linux executables on GitHub's own runners every time you push to
+`main`/`master` (or trigger it manually from the Actions tab) --
+genuine native builds, not emulated. Download the finished `.exe` /
+binary from that workflow run's Artifacts section once it completes.
+This uses standard, well-established GitHub Actions
+(`actions/checkout`, `actions/setup-python`, `actions/upload-artifact`)
+and was checked for YAML correctness, but wasn't watched through an
+actual live run from here -- there's no way to trigger real GitHub
+Actions runners from this environment, so if the first run surfaces
+anything unexpected, the fix is almost certainly a one-line tweak to
+the workflow file, not a deeper problem.
+
+**Manual, on any single machine right now:**
+```bash
+pip install pyinstaller
+python build_executable.py
+# -> dist/terminal-mafia (Linux/Mac) or dist/terminal-mafia.exe (Windows)
+```
+On Windows specifically, also run `pip install windows-curses` first
+if you want the full colorized split-screen client in the built exe
+(otherwise it silently and correctly falls back to the plain-text
+client, same as running from source without that package).
+
 This was built and verified end-to-end on Linux as part of this
 project: a full bots-only match was run to completion through the
 built server executable (`GAME OVER` reached correctly), and the built
@@ -349,10 +368,6 @@ forcing line-buffered stdout/stderr at the top of `launcher.py`
 (`sys.stdout.reconfigure(line_buffering=True)`), which running from
 source via `python run_server.py` doesn't need since Python's own
 default stdio buffering differs there.
-
-If you need a Windows `.exe` for submission and don't have a Windows
-machine handy, run `build_executable.py` on any Windows machine (a
-teammate's laptop, a VM) — it's the same one command either way.
 
 ## Round timers -- customizable at lobby creation
 
